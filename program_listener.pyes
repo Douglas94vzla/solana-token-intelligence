@@ -1,0 +1,47 @@
+import asyncio
+import json
+import websockets
+import os
+import socket
+from dotenv import load_dotenv
+
+load_dotenv()
+
+PUMP_FUN_ID = "6EF8rrecthR5DkwiJvHK6tB57s98S2K9fL2mUMW8"
+
+async def listen_program():
+    uri = os.getenv("WSS_URL")
+    print(f"📡 Intentando conectar a Helius (IPv4 Forzado)...")
+    
+    # Configuramos un tiempo de espera más largo y forzamos IPv4
+    try:
+        async with websockets.connect(
+            uri, 
+            open_timeout=20, 
+            ping_interval=20, 
+            ping_timeout=20,
+            family=socket.AF_INET  # Esto obliga a usar IPv4, evitando el hueco de IPv6
+        ) as ws:
+            payload = {
+                "jsonrpc": "2.0", "id": 1, "method": "programSubscribe",
+                "params": [PUMP_FUN_ID, {"encoding": "jsonDetailed", "commitment": "processed"}]
+            }
+            await ws.send(json.dumps(payload))
+            print(f"✅ Conexión exitosa. Suscrito a Pump.fun.")
+
+            while True:
+                msg = await ws.recv()
+                data = json.loads(msg)
+                if "params" in data:
+                    print(f"\n🔥 ¡ACTIVIDAD DETECTADA!")
+                    print(json.dumps(data, indent=2))
+                    break 
+                else:
+                    print(f"📩 Confirmación recibida: {data.get('result')}")
+                    
+    except Exception as e:
+        print(f"❌ Error de conexión: {e}")
+        print("💡 Tip: Verifica que no haya espacios extra en tu archivo .env")
+
+if __name__ == "__main__": asyncio.run(listen_program())
+

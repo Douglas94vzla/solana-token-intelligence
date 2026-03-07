@@ -11,20 +11,6 @@ Real-time data intelligence platform that captures, processes and analyzes every
 ---
 
 ## 🏗️ Architecture
-cat > ~/solana_bot/README.md << 'EOF'
-# 🚀 Solana Token Intelligence Platform
-
-![Python](https://img.shields.io/badge/Python-3.12-blue)
-![FastAPI](https://img.shields.io/badge/FastAPI-0.100+-green)
-![PostgreSQL](https://img.shields.io/badge/PostgreSQL-16-blue)
-![Solana](https://img.shields.io/badge/Solana-Mainnet-purple)
-![Status](https://img.shields.io/badge/Status-Production-brightgreen)
-
-Real-time data intelligence platform that captures, processes and analyzes every token launched on Solana's Pump.fun — detecting emerging narratives before the market does.
-
----
-
-## 🏗️ Architecture
 ```
 Solana Blockchain (Pump.fun)
          │
@@ -50,6 +36,12 @@ fetcher    (DexScreener)  (NLP + TF-IDF)
 │   /tokens  /trends  /stats      │
 │   /trends/emerging  /search     │
 └─────────────────────────────────┘
+         │
+         ▼
+┌─────────────────────────────────┐
+│     Streamlit Dashboard         │
+│   Real-time visual intelligence │
+└─────────────────────────────────┘
 ```
 
 ---
@@ -60,6 +52,7 @@ fetcher    (DexScreener)  (NLP + TF-IDF)
 - **Price intelligence** — Fetches initial price 10 seconds after launch via DexScreener
 - **Trend detection** — NLP engine analyzes token names to detect emerging narratives
 - **REST API** — Full FastAPI with auto-generated Swagger documentation
+- **Live Dashboard** — Real-time Streamlit dashboard with charts and live feed
 - **Production-grade** — All services run as systemd daemons with auto-restart
 - **Structured logging** — Professional logging with rotation in `/var/log/solana_bot/`
 
@@ -69,11 +62,12 @@ fetcher    (DexScreener)  (NLP + TF-IDF)
 
 | Metric | Value |
 |--------|-------|
-| Tokens captured | 68,000+ |
+| Tokens captured | 72,000+ |
 | Capture rate | ~900 tokens/hour |
 | Uptime | 24/7 |
 | API endpoints | 7 |
 | DB tables | 4 |
+| Services running | 6 |
 
 ---
 
@@ -84,6 +78,7 @@ fetcher    (DexScreener)  (NLP + TF-IDF)
 | Blockchain listener | Python + WebSockets |
 | Database | PostgreSQL 16 |
 | API Framework | FastAPI + Uvicorn |
+| Dashboard | Streamlit + Plotly |
 | Price data | DexScreener API |
 | Metadata | Helius RPC |
 | NLP | Regex + TF-IDF |
@@ -99,6 +94,7 @@ systemctl status metadata-fetcher    # Metadata enrichment every 5 min
 systemctl status price-fetcher       # Price updates every 30 sec
 systemctl status trend-engine        # Trend analysis every hour
 systemctl status solana-api          # REST API on port 8000
+systemctl status solana-dashboard    # Dashboard on port 8501
 ```
 
 ---
@@ -134,7 +130,7 @@ git clone https://github.com/Douglas94vzla/solana-token-intelligence.git
 cd solana-token-intelligence
 
 # Create virtual environment
-python3 -m install venv venv
+python3 -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
 
@@ -142,15 +138,13 @@ pip install -r requirements.txt
 cp .env.example .env
 # Edit .env with your credentials
 
-# Setup database
-psql -U postgres -f schema.sql
-
 # Start services
 systemctl start pump-harvester
 systemctl start metadata-fetcher.timer
 systemctl start price-fetcher
 systemctl start trend-engine.timer
 systemctl start solana-api
+systemctl start solana-dashboard
 ```
 
 ---
@@ -163,6 +157,7 @@ solana_bot/
 ├── price_fetcher.py       # DexScreener price intelligence
 ├── trend_engine.py        # NLP trend detection engine
 ├── api.py                 # FastAPI REST API
+├── dashboard.py           # Streamlit real-time dashboard
 ├── requirements.txt       # Python dependencies
 ├── .env.example           # Environment template
 └── README.md              # This file
@@ -175,4 +170,3 @@ solana_bot/
 **Douglas Alvarez** — [@Douglas94vzla](https://github.com/Douglas94vzla)
 
 > Built as part of a professional data engineering portfolio demonstrating real-time blockchain data pipelines, NLP trend analysis, and production-grade API development.
-

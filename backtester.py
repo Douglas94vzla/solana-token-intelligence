@@ -28,9 +28,9 @@ pool = psycopg2.pool.ThreadedConnectionPool(
 # ── PARÁMETROS DE ESTRATEGIA ──────────────────────────
 CAPITAL = 100.0          # Capital inicial en USD
 BET_SIZE = 10.0          # Cuánto arriesgar por trade
-TAKE_PROFIT = 3.0        # Salir cuando el precio 3x
+TAKE_PROFIT = 999.0        # Salir cuando el precio 3x
 STOP_LOSS = 0.5          # Salir cuando pierde 50%
-MAX_HOLD_MINUTES = 60    # Salir después de 60 min pase lo que pase
+MAX_HOLD_MINUTES = 120    # Salir después de 60 min pase lo que pase
 
 # ── FILTROS DE ENTRADA ────────────────────────────────
 MIN_BUYS_5M = 5          # Mínimo de compras en 5 min
@@ -56,6 +56,10 @@ def get_candidates():
             AND market_cap <= %s
             AND price_usd IS NOT NULL
             AND created_at > NOW() - INTERVAL '5 days'
+            AND mint IN (
+                SELECT mint FROM price_snapshots 
+                GROUP BY mint HAVING COUNT(*) >= 50
+            )
             ORDER BY created_at DESC
         """, (MIN_BUYS_5M, MAX_SELLS_5M, MIN_MCAP, MAX_MCAP))
         rows = cur.fetchall()
@@ -233,3 +237,7 @@ if __name__ == "__main__":
     log.info("🔬 Backtester iniciando...")
     run_backtest()
     log.info("✅ Backtest completado")
+
+# OVERRIDE: solo tokens con snapshots suficientes
+import sys
+sys.exit(0)

@@ -14,7 +14,6 @@ logging.basicConfig(
     format='%(asctime)s [%(levelname)s] %(message)s',
     handlers=[
         logging.FileHandler('/var/log/solana_bot/price_fetcher.log'),
-        logging.StreamHandler()
     ]
 )
 log = logging.getLogger(__name__)
@@ -125,7 +124,7 @@ def get_tokens_to_update(limit=100):
         cur = conn.cursor()
         cur.execute("""
             SELECT mint FROM discovered_tokens
-            WHERE name IS NOT NULL AND name != ''
+            WHERE price_usd IS NOT NULL
             AND created_at > NOW() - INTERVAL '24 hours'
             AND (price_updated_at IS NULL OR price_updated_at < NOW() - INTERVAL '10 minutes')
             ORDER BY created_at DESC

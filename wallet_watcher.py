@@ -16,7 +16,6 @@ logging.basicConfig(
     format='%(asctime)s [%(levelname)s] %(message)s',
     handlers=[
         logging.FileHandler('/var/log/solana_bot/wallet_watcher.log'),
-        logging.StreamHandler()
     ]
 )
 log = logging.getLogger(__name__)
@@ -54,6 +53,7 @@ def setup_db():
                 signature TEXT,
                 alerted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
+            ALTER TABLE wallet_alerts ADD COLUMN IF NOT EXISTS mcap NUMERIC;
         """)
         conn.commit()
         cur.close()

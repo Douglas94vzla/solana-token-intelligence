@@ -55,7 +55,7 @@ if __name__ == "__main__":
         AND created_at < NOW() - INTERVAL '5 minutes'
         AND (fetch_attempts IS NULL OR fetch_attempts < 5)
         ORDER BY fetch_attempts ASC NULLS FIRST, created_at ASC
-        LIMIT 50
+        LIMIT 500
     """)
     tokens = cur.fetchall()
     print(f"Tokens pendientes: {len(tokens)}")

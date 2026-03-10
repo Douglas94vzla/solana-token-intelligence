@@ -211,7 +211,7 @@ def check_new_signals():
             FROM discovered_tokens dt
             WHERE dt.entry_signal = 'ENTER'
             AND dt.ml_probability >= 65
-            AND dt.entry_at > NOW() - INTERVAL '5 minutes'
+            AND dt.entry_at > NOW() - INTERVAL '30 minutes'
             AND dt.mint NOT IN (
                 SELECT mint FROM paper_trades
                 WHERE status = 'OPEN'

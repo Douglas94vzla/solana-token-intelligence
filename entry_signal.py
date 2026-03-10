@@ -17,7 +17,6 @@ logging.basicConfig(
     format='%(asctime)s [%(levelname)s] %(message)s',
     handlers=[
         logging.FileHandler('/var/log/solana_bot/entry_signal.log'),
-        logging.StreamHandler()
     ]
 )
 log = logging.getLogger(__name__)
@@ -175,7 +174,8 @@ def ml_predict(mint):
             'survival_score', 'narrative', 'buys_1h', 'sells_1h',
             'rug_score', 'holder_count', 'top10_concentration'
         ])
-        df = df.apply(pd.to_numeric, errors='ignore')
+        numeric_cols = [c for c in df.columns if c != 'narrative']
+        df[numeric_cols] = df[numeric_cols].apply(pd.to_numeric, errors='coerce')
 
         # Feature engineering (mismo que ml_model.py)
         df['buy_sell_ratio']    = df['buys_5m'] / (df['sells_5m'] + 1)

@@ -1,6 +1,7 @@
 import psycopg2
 import psycopg2.pool
 import os
+import time
 import logging
 import requests
 from datetime import datetime, timedelta, timezone
@@ -29,18 +30,20 @@ pool = psycopg2.pool.ThreadedConnectionPool(
 )
 
 # ── RISK MANAGEMENT ───────────────────────────────────
-INITIAL_CAPITAL  = 1000.0   # Capital simulado
-TRADE_SIZE_PCT   = 0.02     # 2% por trade
-MAX_OPEN_TRADES  = 3        # Máximo trades simultáneos
-TAKE_PROFIT      = 1.50     # +50% TP
-STOP_LOSS        = 0.70     # -30% stop inicial fijo
-TRAIL_PCT        = 0.20     # Trailing: cierra si cae 20% desde el pico
-TRAIL_ACTIVATE   = 0.10     # Trailing activa solo si el trade subió 10%+
-MAX_HOLD_MINUTES = 120      # Timeout 2 horas
-DAILY_LOSS_LIMIT = 0.03     # Parar si perdemos 3% en el día
-SLIPPAGE         = 0.03     # 3% slippage simulado
-FEES             = 0.005    # 0.5% fees
-TRADE_HOURS_UTC  = (13, 23) # Solo abrir trades entre 13h y 23h UTC
+INITIAL_CAPITAL       = 1000.0   # Capital simulado
+TRADE_SIZE_PCT        = 0.02     # 2% por trade
+MAX_OPEN_TRADES       = 3        # Máximo trades simultáneos
+TAKE_PROFIT           = 1.50     # +50% TP
+STOP_LOSS             = 0.70     # -30% stop inicial fijo
+TRAIL_PCT             = 0.20     # Trailing: cierra si cae 20% desde el pico
+TRAIL_ACTIVATE        = 0.10     # Trailing activa solo si el trade subió 10%+
+MAX_HOLD_MINUTES      = 120      # Timeout 2 horas
+DAILY_LOSS_LIMIT      = 0.03     # Parar si perdemos 3% en el día
+SLIPPAGE              = 0.03     # 3% slippage simulado
+FEES                  = 0.005    # 0.5% fees
+TRADE_HOURS_UTC       = (13, 23) # Solo abrir trades entre 13h y 23h UTC
+POSITION_CHECK_INTERVAL = 10     # Revisar posiciones abiertas cada 10s
+SIGNAL_CHECK_INTERVAL   = 60     # Buscar señales nuevas cada 60s
 
 def setup_db():
     conn = pool.getconn()
@@ -230,6 +233,8 @@ def check_new_signals():
             WHERE dt.entry_signal = 'ENTER'
               AND dt.ml_probability >= 65
               AND dt.entry_at > NOW() - INTERVAL '30 minutes'
+              AND dt.market_cap >= 10000
+              AND dt.liquidity_usd >= 5000
               AND dt.mint NOT IN (
                   SELECT mint FROM paper_trades
                   WHERE status = 'OPEN'
@@ -335,20 +340,101 @@ def print_summary():
     finally:
         pool.putconn(conn)
 
+def manage_open_trades(cap):
+    """Revisa y gestiona todas las posiciones abiertas. Llamado cada 10s."""
+    open_trades = get_open_trades()
+    for trade in open_trades:
+        tid, mint, name, symbol, entry_price, trade_size, \
+            ml_prob, score, opened_at, peak_price = trade
+
+        current_price = get_current_price(mint)
+        if not current_price:
+            continue
+
+        entry = float(entry_price)
+        peak  = float(peak_price) if peak_price else entry
+
+        # Actualizar precio pico
+        if current_price > peak:
+            peak = current_price
+            update_peak_price(tid, peak)
+
+        # ── TAKE PROFIT ────────────────────────────
+        if current_price >= entry * TAKE_PROFIT:
+            pnl, pnl_pct = close_trade(
+                tid, mint, name, entry_price,
+                float(trade_size), current_price, "TAKE_PROFIT"
+            )
+            cap['capital']   += float(trade_size) + pnl
+            cap['daily_pnl'] += pnl
+            cap['total_pnl'] += pnl
+            cap['wins' if pnl > 0 else 'losses'] += 1
+            update_capital(**cap)
+
+        # ── TRAILING STOP ──────────────────────────
+        # Activa solo si el trade subió TRAIL_ACTIVATE%+
+        # Stop = peak * (1 - TRAIL_PCT)
+        elif (peak >= entry * (1 + TRAIL_ACTIVATE) and
+              current_price <= peak * (1 - TRAIL_PCT)):
+            trail_level = peak * (1 - TRAIL_PCT)
+            gain_at_peak = (peak - entry) / entry * 100
+            log.info(f"🔔 TRAILING STOP #{tid} | Peak: +{gain_at_peak:.1f}% | "
+                     f"Trail: ${trail_level:.8f}")
+            pnl, pnl_pct = close_trade(
+                tid, mint, name, entry_price,
+                float(trade_size), current_price, "TRAILING_STOP"
+            )
+            cap['capital']   += float(trade_size) + pnl
+            cap['daily_pnl'] += pnl
+            cap['total_pnl'] += pnl
+            cap['wins' if pnl > 0 else 'losses'] += 1
+            update_capital(**cap)
+
+        # ── STOP LOSS FIJO ─────────────────────────
+        elif current_price <= entry * STOP_LOSS:
+            pnl, pnl_pct = close_trade(
+                tid, mint, name, entry_price,
+                float(trade_size), current_price, "STOP_LOSS"
+            )
+            cap['capital']   += float(trade_size) + pnl
+            cap['daily_pnl'] += pnl
+            cap['total_pnl'] += pnl
+            cap['losses']    += 1
+            update_capital(**cap)
+
+        # ── TIMEOUT ────────────────────────────────
+        elif (datetime.now() - opened_at.replace(tzinfo=None) >
+              timedelta(minutes=MAX_HOLD_MINUTES)):
+            pnl, pnl_pct = close_trade(
+                tid, mint, name, entry_price,
+                float(trade_size), current_price, "TIMEOUT"
+            )
+            cap['capital']   += float(trade_size) + pnl
+            cap['daily_pnl'] += pnl
+            cap['total_pnl'] += pnl
+            cap['wins' if pnl > 0 else 'losses'] += 1
+            update_capital(**cap)
+
+    return cap
+
+
 def run():
     setup_db()
     log.info("💰 Paper Trading Engine arrancando...")
+    log.info(f"⏱  Ciclo posiciones: {POSITION_CHECK_INTERVAL}s | Ciclo señales: {SIGNAL_CHECK_INTERVAL}s")
     alert_system_status("OK", "Paper Trading Engine iniciado")
 
-    last_daily_reset = datetime.now().date()
+    last_daily_reset  = datetime.now().date()
+    last_signal_check = 0.0   # timestamp de la última búsqueda de señales
+    last_summary      = 0.0
 
     while True:
         try:
-            import time
+            now = time.monotonic()
 
             # ── RESET DIARIO ───────────────────────────────
             if datetime.now().date() > last_daily_reset:
-                send_daily_summary()          # Telegram antes del reset
+                send_daily_summary()
                 reset_daily_pnl()
                 last_daily_reset = datetime.now().date()
 
@@ -360,106 +446,38 @@ def run():
 
             cap = get_capital()
 
-            # ── GESTIONAR TRADES ABIERTOS ──────────────────
-            open_trades = get_open_trades()
-            for trade in open_trades:
-                tid, mint, name, symbol, entry_price, trade_size, \
-                    ml_prob, score, opened_at, peak_price = trade
+            # ── GESTIONAR POSICIONES ABIERTAS (cada 10s) ───
+            cap = manage_open_trades(cap)
 
-                current_price = get_current_price(mint)
-                if not current_price:
-                    continue
+            # ── ABRIR NUEVOS TRADES (cada 60s) ─────────────
+            if now - last_signal_check >= SIGNAL_CHECK_INTERVAL:
+                last_signal_check = now
+                if is_trading_hours():
+                    open_trades = get_open_trades()
+                    if len(open_trades) < MAX_OPEN_TRADES:
+                        signals = check_new_signals()
+                        for sig in signals:
+                            if len(get_open_trades()) >= MAX_OPEN_TRADES:
+                                break
+                            mint, name, symbol, price, ml_prob, score, narrative = sig
+                            if price:
+                                cap = get_capital()
+                                open_trade(mint, name, symbol, price,
+                                           ml_prob, score, narrative, cap['capital'])
+                                cap['capital'] -= cap['capital'] * TRADE_SIZE_PCT
+                                update_capital(**cap)
+                else:
+                    hour = datetime.now(timezone.utc).hour
+                    log.debug(f"🌙 Fuera de horario ({hour}h UTC) — no se abren nuevos trades")
 
-                entry = float(entry_price)
-                peak  = float(peak_price) if peak_price else entry
+                if now - last_summary >= SIGNAL_CHECK_INTERVAL:
+                    last_summary = now
+                    print_summary()
 
-                # Actualizar precio pico
-                if current_price > peak:
-                    peak = current_price
-                    update_peak_price(tid, peak)
-
-                # ── TAKE PROFIT ────────────────────────────
-                if current_price >= entry * TAKE_PROFIT:
-                    pnl, pnl_pct = close_trade(
-                        tid, mint, name, entry_price,
-                        float(trade_size), current_price, "TAKE_PROFIT"
-                    )
-                    cap['capital']   += float(trade_size) + pnl
-                    cap['daily_pnl'] += pnl
-                    cap['total_pnl'] += pnl
-                    cap['wins' if pnl > 0 else 'losses'] += 1
-                    update_capital(**cap)
-
-                # ── TRAILING STOP ──────────────────────────
-                # Activa solo si el trade subió TRAIL_ACTIVATE%+
-                # Stop = peak * (1 - TRAIL_PCT)
-                elif (peak >= entry * (1 + TRAIL_ACTIVATE) and
-                      current_price <= peak * (1 - TRAIL_PCT)):
-                    trail_level = peak * (1 - TRAIL_PCT)
-                    gain_at_peak = (peak - entry) / entry * 100
-                    log.info(f"🔔 TRAILING STOP #{tid} | Peak: +{gain_at_peak:.1f}% | "
-                             f"Trail: ${trail_level:.8f}")
-                    pnl, pnl_pct = close_trade(
-                        tid, mint, name, entry_price,
-                        float(trade_size), current_price, "TRAILING_STOP"
-                    )
-                    cap['capital']   += float(trade_size) + pnl
-                    cap['daily_pnl'] += pnl
-                    cap['total_pnl'] += pnl
-                    cap['wins' if pnl > 0 else 'losses'] += 1
-                    update_capital(**cap)
-
-                # ── STOP LOSS FIJO ─────────────────────────
-                elif current_price <= entry * STOP_LOSS:
-                    pnl, pnl_pct = close_trade(
-                        tid, mint, name, entry_price,
-                        float(trade_size), current_price, "STOP_LOSS"
-                    )
-                    cap['capital']   += float(trade_size) + pnl
-                    cap['daily_pnl'] += pnl
-                    cap['total_pnl'] += pnl
-                    cap['losses']    += 1
-                    update_capital(**cap)
-
-                # ── TIMEOUT ────────────────────────────────
-                elif (datetime.now() - opened_at.replace(tzinfo=None) >
-                      timedelta(minutes=MAX_HOLD_MINUTES)):
-                    pnl, pnl_pct = close_trade(
-                        tid, mint, name, entry_price,
-                        float(trade_size), current_price, "TIMEOUT"
-                    )
-                    cap['capital']   += float(trade_size) + pnl
-                    cap['daily_pnl'] += pnl
-                    cap['total_pnl'] += pnl
-                    cap['wins' if pnl > 0 else 'losses'] += 1
-                    update_capital(**cap)
-
-            # ── ABRIR NUEVOS TRADES ────────────────────────
-            # Solo en horario activo (13h–23h UTC)
-            if is_trading_hours():
-                open_trades = get_open_trades()
-                if len(open_trades) < MAX_OPEN_TRADES:
-                    signals = check_new_signals()
-                    for sig in signals:
-                        if len(get_open_trades()) >= MAX_OPEN_TRADES:
-                            break
-                        mint, name, symbol, price, ml_prob, score, narrative = sig
-                        if price:
-                            cap = get_capital()
-                            open_trade(mint, name, symbol, price,
-                                       ml_prob, score, narrative, cap['capital'])
-                            cap['capital'] -= cap['capital'] * TRADE_SIZE_PCT
-                            update_capital(**cap)
-            else:
-                hour = datetime.now(timezone.utc).hour
-                log.debug(f"🌙 Fuera de horario ({hour}h UTC) — no se abren nuevos trades")
-
-            print_summary()
-            time.sleep(60)
+            time.sleep(POSITION_CHECK_INTERVAL)
 
         except Exception as e:
             log.error(f"Error en paper trading: {e}")
-            import time
             time.sleep(30)
 
 if __name__ == "__main__":

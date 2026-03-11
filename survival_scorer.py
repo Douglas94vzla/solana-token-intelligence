@@ -29,13 +29,18 @@ def setup_db():
     conn = pool.getconn()
     try:
         cur = conn.cursor()
-        cur.execute("""
-            ALTER TABLE discovered_tokens
-            ADD COLUMN IF NOT EXISTS survival_score INTEGER DEFAULT 0,
-            ADD COLUMN IF NOT EXISTS signal TEXT DEFAULT 'IGNORE',
-            ADD COLUMN IF NOT EXISTS scored_at TIMESTAMP
-        """)
-        conn.commit()
+        try:
+            cur.execute("SET lock_timeout = '5s'")
+            cur.execute("""
+                ALTER TABLE discovered_tokens
+                ADD COLUMN IF NOT EXISTS survival_score INTEGER DEFAULT 0,
+                ADD COLUMN IF NOT EXISTS signal TEXT DEFAULT 'IGNORE',
+                ADD COLUMN IF NOT EXISTS scored_at TIMESTAMP
+            """)
+            conn.commit()
+        except Exception as e:
+            conn.rollback()
+            log.warning(f"ALTER TABLE skipped (lock timeout): {e}")
         cur.close()
         log.info("✅ Columnas de scoring añadidas")
     finally:

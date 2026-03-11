@@ -154,12 +154,17 @@ def get_connection():
     )
 
 def query(sql, params=None):
+    conn = None
     try:
         conn = get_connection()
-        return pd.read_sql(sql, conn, params=params)
+        result = pd.read_sql(sql, conn, params=params)
+        return result
     except Exception as e:
         st.error(f"DB Error: {e}")
         return pd.DataFrame()
+    finally:
+        if conn:
+            conn.close()
 
 # ── HEADER ──────────────────────────────────────────
 st.markdown('<div class="header-title">⚡ SOLANA INTELLIGENCE</div>', unsafe_allow_html=True)

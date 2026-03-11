@@ -32,16 +32,21 @@ def setup_db():
     conn = pool.getconn()
     try:
         cur = conn.cursor()
-        cur.execute("""
-            ALTER TABLE discovered_tokens
-            ADD COLUMN IF NOT EXISTS rug_score INTEGER DEFAULT NULL,
-            ADD COLUMN IF NOT EXISTS rug_flags TEXT DEFAULT NULL,
-            ADD COLUMN IF NOT EXISTS top10_concentration NUMERIC(5,2) DEFAULT NULL,
-            ADD COLUMN IF NOT EXISTS holder_count INTEGER DEFAULT NULL,
-            ADD COLUMN IF NOT EXISTS dev_sold BOOLEAN DEFAULT FALSE,
-            ADD COLUMN IF NOT EXISTS rug_checked_at TIMESTAMP DEFAULT NULL;
-        """)
-        conn.commit()
+        try:
+            cur.execute("SET lock_timeout = '5s'")
+            cur.execute("""
+                ALTER TABLE discovered_tokens
+                ADD COLUMN IF NOT EXISTS rug_score INTEGER DEFAULT NULL,
+                ADD COLUMN IF NOT EXISTS rug_flags TEXT DEFAULT NULL,
+                ADD COLUMN IF NOT EXISTS top10_concentration NUMERIC(5,2) DEFAULT NULL,
+                ADD COLUMN IF NOT EXISTS holder_count INTEGER DEFAULT NULL,
+                ADD COLUMN IF NOT EXISTS dev_sold BOOLEAN DEFAULT FALSE,
+                ADD COLUMN IF NOT EXISTS rug_checked_at TIMESTAMP DEFAULT NULL
+            """)
+            conn.commit()
+        except Exception as e:
+            conn.rollback()
+            log.warning(f"ALTER TABLE skipped (lock timeout): {e}")
         cur.close()
         log.info("✅ Columnas de rug detector añadidas")
     finally:

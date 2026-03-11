@@ -66,16 +66,23 @@ def setup_db():
             );
             CREATE INDEX IF NOT EXISTS idx_snapshots_mint ON price_snapshots(mint);
             CREATE INDEX IF NOT EXISTS idx_snapshots_time ON price_snapshots(snapshot_at DESC);
-
-            ALTER TABLE discovered_tokens
-            ADD COLUMN IF NOT EXISTS entry_signal TEXT DEFAULT 'WAIT',
-            ADD COLUMN IF NOT EXISTS entry_price NUMERIC(20,10),
-            ADD COLUMN IF NOT EXISTS entry_at TIMESTAMP,
-            ADD COLUMN IF NOT EXISTS price_change_15m NUMERIC(10,2),
-            ADD COLUMN IF NOT EXISTS price_change_1h NUMERIC(10,2),
-            ADD COLUMN IF NOT EXISTS ml_probability NUMERIC(5,2);
         """)
         conn.commit()
+        try:
+            cur.execute("SET lock_timeout = '5s'")
+            cur.execute("""
+                ALTER TABLE discovered_tokens
+                ADD COLUMN IF NOT EXISTS entry_signal TEXT DEFAULT 'WAIT',
+                ADD COLUMN IF NOT EXISTS entry_price NUMERIC(20,10),
+                ADD COLUMN IF NOT EXISTS entry_at TIMESTAMP,
+                ADD COLUMN IF NOT EXISTS price_change_15m NUMERIC(10,2),
+                ADD COLUMN IF NOT EXISTS price_change_1h NUMERIC(10,2),
+                ADD COLUMN IF NOT EXISTS ml_probability NUMERIC(5,2)
+            """)
+            conn.commit()
+        except Exception as e:
+            conn.rollback()
+            log.warning(f"ALTER TABLE skipped (lock timeout): {e}")
         cur.close()
         log.info("✅ Tablas de señales creadas")
     finally:
@@ -144,10 +151,21 @@ def get_token_features(mint):
         cur = conn.cursor()
         cur.execute("""
             SELECT buys_5m, sells_5m, market_cap, volume_24h,
+                   COALESCE(volume_1h, 0)              as volume_1h,
+                   COALESCE(volume_5m, 0)              as volume_5m,
                    survival_score, narrative, buys_1h, sells_1h,
-                   COALESCE(rug_score, 50)            as rug_score,
-                   COALESCE(holder_count, 10)         as holder_count,
-                   COALESCE(top10_concentration, 95)  as top10_concentration
+                   COALESCE(buys_24h, 0)               as buys_24h,
+                   COALESCE(sells_24h, 0)              as sells_24h,
+                   COALESCE(rug_score, 50)             as rug_score,
+                   COALESCE(holder_count, 10)          as holder_count,
+                   COALESCE(top10_concentration, 95)   as top10_concentration,
+                   COALESCE(dev_sold, FALSE)           as dev_sold,
+                   (twitter  IS NOT NULL)              as has_twitter,
+                   (telegram IS NOT NULL)              as has_telegram,
+                   (website  IS NOT NULL)              as has_website,
+                   EXTRACT(HOUR FROM created_at)       as launch_hour,
+                   COALESCE(liquidity_usd, 0)          as liquidity_usd,
+                   COALESCE(fdv, 0)                    as fdv
             FROM discovered_tokens WHERE mint = %s
         """, (mint,))
         row = cur.fetchone()
@@ -171,23 +189,40 @@ def ml_predict(mint):
     try:
         df = pd.DataFrame([row], columns=[
             'buys_5m', 'sells_5m', 'market_cap', 'volume_24h',
-            'survival_score', 'narrative', 'buys_1h', 'sells_1h',
-            'rug_score', 'holder_count', 'top10_concentration'
+            'volume_1h', 'volume_5m', 'survival_score', 'narrative',
+            'buys_1h', 'sells_1h', 'buys_24h', 'sells_24h',
+            'rug_score', 'holder_count', 'top10_concentration',
+            'dev_sold', 'has_twitter', 'has_telegram', 'has_website',
+            'launch_hour', 'liquidity_usd', 'fdv'
         ])
         numeric_cols = [c for c in df.columns if c != 'narrative']
         df[numeric_cols] = df[numeric_cols].apply(pd.to_numeric, errors='coerce')
 
-        # Feature engineering (mismo que ml_model.py)
-        df['buy_sell_ratio']    = df['buys_5m'] / (df['sells_5m'] + 1)
-        df['buy_sell_ratio_1h'] = df['buys_1h'] / (df['sells_1h'] + 1)
-        df['net_buy_pressure']  = df['buys_5m'] - df['sells_5m']
-        df['vol_to_mcap']       = df['volume_24h'] / (df['market_cap'] + 1)
-        df['log_mcap']          = np.log1p(df['market_cap'])
-        df['log_volume']        = np.log1p(df['volume_24h'])
-        df['score_normalized']  = df['survival_score'] / 100.0
-        df['holder_risk']       = df['top10_concentration'] / 100.0
-        df['zero_sells']        = (df['sells_5m'] == 0).astype(int)
-        df['optimal_mcap']      = ((df['market_cap'] >= 1000) & (df['market_cap'] <= 5000)).astype(int)
+        # Feature engineering — debe coincidir exactamente con ml_model.py
+        df['buy_sell_ratio']     = df['buys_5m']  / (df['sells_5m']  + 1)
+        df['buy_sell_ratio_1h']  = df['buys_1h']  / (df['sells_1h']  + 1)
+        df['buy_sell_ratio_24h'] = df['buys_24h'] / (df['sells_24h'] + 1)
+        df['net_buy_pressure']   = df['buys_5m'] - df['sells_5m']
+        df['vol_to_mcap']        = df['volume_24h'] / (df['market_cap'] + 1)
+        df['vol5m_to_mcap']      = df['volume_5m']  / (df['market_cap'] + 1)
+        df['log_mcap']           = np.log1p(df['market_cap'])
+        df['log_volume']         = np.log1p(df['volume_24h'])
+        df['log_volume_1h']      = np.log1p(df['volume_1h'])
+        df['log_volume_5m']      = np.log1p(df['volume_5m'])
+        df['score_normalized']   = df['survival_score'] / 100.0
+        df['holder_risk']        = df['top10_concentration'] / 100.0
+        df['zero_sells']         = (df['sells_5m'] == 0).astype(int)
+        df['dev_sold']           = df['dev_sold'].astype(int)
+        df['has_twitter']        = df['has_twitter'].astype(int)
+        df['has_telegram']       = df['has_telegram'].astype(int)
+        df['has_website']        = df['has_website'].astype(int)
+        df['optimal_mcap']       = ((df['market_cap'] >= 1000) & (df['market_cap'] <= 10000)).astype(int)
+        df['peak_hours']         = df['launch_hour'].apply(lambda h: 1 if 14 <= h <= 22 else 0)
+        df['log_liquidity']      = np.log1p(df['liquidity_usd'])
+        df['liquidity_to_mcap']  = df['liquidity_usd'] / (df['market_cap'] + 1)
+        df['has_liquidity']      = (df['liquidity_usd'] > 1000).astype(int)
+        df['log_fdv']            = np.log1p(df['fdv'])
+        df['fdv_to_mcap']        = df['fdv'] / (df['market_cap'] + 1)
 
         try:
             df['narrative_encoded'] = label_encoder.transform(df['narrative'].fillna('OTHER'))
@@ -196,14 +231,23 @@ def ml_predict(mint):
 
         features = [
             'buys_5m', 'sells_5m', 'market_cap', 'volume_24h',
-            'survival_score', 'buys_1h', 'sells_1h',
+            'volume_1h', 'volume_5m', 'survival_score',
+            'buys_1h', 'sells_1h', 'buys_24h', 'sells_24h',
             'rug_score', 'holder_count', 'top10_concentration',
-            'buy_sell_ratio', 'buy_sell_ratio_1h', 'net_buy_pressure',
-            'vol_to_mcap', 'log_mcap', 'log_volume', 'score_normalized',
-            'holder_risk', 'narrative_encoded', 'zero_sells', 'optimal_mcap'
+            'launch_hour',
+            'buy_sell_ratio', 'buy_sell_ratio_1h', 'buy_sell_ratio_24h',
+            'net_buy_pressure', 'vol_to_mcap', 'vol5m_to_mcap',
+            'log_mcap', 'log_volume', 'log_volume_1h', 'log_volume_5m',
+            'score_normalized', 'holder_risk',
+            'narrative_encoded',
+            'zero_sells', 'optimal_mcap', 'peak_hours',
+            'dev_sold', 'has_twitter', 'has_telegram', 'has_website',
+            'has_liquidity',
+            'liquidity_usd', 'log_liquidity', 'liquidity_to_mcap',
+            'fdv', 'log_fdv', 'fdv_to_mcap',
         ]
 
-        X = df[features].fillna(0)
+        X = df[features].fillna(0).values
         proba = float(ml_model.predict_proba(X)[0][1])
         return round(proba * 100, 1), proba >= ML_THRESHOLD
 

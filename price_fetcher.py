@@ -31,23 +31,30 @@ def setup_db():
     conn = pool.getconn()
     try:
         cur = conn.cursor()
-        cur.execute("""
-            ALTER TABLE discovered_tokens 
-            ADD COLUMN IF NOT EXISTS price_usd NUMERIC(20,10),
-            ADD COLUMN IF NOT EXISTS market_cap NUMERIC(20,2),
-            ADD COLUMN IF NOT EXISTS volume_24h NUMERIC(20,2),
-            ADD COLUMN IF NOT EXISTS volume_1h NUMERIC(20,2),
-            ADD COLUMN IF NOT EXISTS volume_5m NUMERIC(20,2),
-            ADD COLUMN IF NOT EXISTS buys_24h INTEGER,
-            ADD COLUMN IF NOT EXISTS sells_24h INTEGER,
-            ADD COLUMN IF NOT EXISTS buys_1h INTEGER,
-            ADD COLUMN IF NOT EXISTS sells_1h INTEGER,
-            ADD COLUMN IF NOT EXISTS buys_5m INTEGER,
-            ADD COLUMN IF NOT EXISTS sells_5m INTEGER,
-            ADD COLUMN IF NOT EXISTS pair_address TEXT,
-            ADD COLUMN IF NOT EXISTS price_updated_at TIMESTAMP
-        """)
-        conn.commit()
+        try:
+            cur.execute("SET lock_timeout = '5s'")
+            cur.execute("""
+                ALTER TABLE discovered_tokens
+                ADD COLUMN IF NOT EXISTS price_usd NUMERIC(20,10),
+                ADD COLUMN IF NOT EXISTS market_cap NUMERIC(20,2),
+                ADD COLUMN IF NOT EXISTS volume_24h NUMERIC(20,2),
+                ADD COLUMN IF NOT EXISTS volume_1h NUMERIC(20,2),
+                ADD COLUMN IF NOT EXISTS volume_5m NUMERIC(20,2),
+                ADD COLUMN IF NOT EXISTS buys_24h INTEGER,
+                ADD COLUMN IF NOT EXISTS sells_24h INTEGER,
+                ADD COLUMN IF NOT EXISTS buys_1h INTEGER,
+                ADD COLUMN IF NOT EXISTS sells_1h INTEGER,
+                ADD COLUMN IF NOT EXISTS buys_5m INTEGER,
+                ADD COLUMN IF NOT EXISTS sells_5m INTEGER,
+                ADD COLUMN IF NOT EXISTS pair_address TEXT,
+                ADD COLUMN IF NOT EXISTS liquidity_usd NUMERIC(20,2),
+                ADD COLUMN IF NOT EXISTS fdv NUMERIC(20,2),
+                ADD COLUMN IF NOT EXISTS price_updated_at TIMESTAMP
+            """)
+            conn.commit()
+        except Exception as e:
+            conn.rollback()
+            log.warning(f"ALTER TABLE skipped (lock timeout): {e}")
         cur.close()
         log.info("✅ Columnas de precio añadidas")
     finally:
@@ -64,18 +71,20 @@ async def fetch_price(session, mint):
             # Tomar el par con mayor volumen 24h
             pair = max(pairs, key=lambda p: p.get("volume", {}).get("h24", 0))
             return mint, {
-                "price_usd": pair.get("priceUsd"),
-                "market_cap": pair.get("marketCap"),
-                "volume_24h": pair.get("volume", {}).get("h24"),
-                "volume_1h": pair.get("volume", {}).get("h1"),
-                "volume_5m": pair.get("volume", {}).get("m5"),
-                "buys_24h": pair.get("txns", {}).get("h24", {}).get("buys"),
-                "sells_24h": pair.get("txns", {}).get("h24", {}).get("sells"),
-                "buys_1h": pair.get("txns", {}).get("h1", {}).get("buys"),
-                "sells_1h": pair.get("txns", {}).get("h1", {}).get("sells"),
-                "buys_5m": pair.get("txns", {}).get("m5", {}).get("buys"),
-                "sells_5m": pair.get("txns", {}).get("m5", {}).get("sells"),
-                "pair_address": pair.get("pairAddress"),
+                "price_usd":     pair.get("priceUsd"),
+                "market_cap":    pair.get("marketCap"),
+                "volume_24h":    pair.get("volume", {}).get("h24"),
+                "volume_1h":     pair.get("volume", {}).get("h1"),
+                "volume_5m":     pair.get("volume", {}).get("m5"),
+                "buys_24h":      pair.get("txns", {}).get("h24", {}).get("buys"),
+                "sells_24h":     pair.get("txns", {}).get("h24", {}).get("sells"),
+                "buys_1h":       pair.get("txns", {}).get("h1", {}).get("buys"),
+                "sells_1h":      pair.get("txns", {}).get("h1", {}).get("sells"),
+                "buys_5m":       pair.get("txns", {}).get("m5", {}).get("buys"),
+                "sells_5m":      pair.get("txns", {}).get("m5", {}).get("sells"),
+                "pair_address":  pair.get("pairAddress"),
+                "liquidity_usd": pair.get("liquidity", {}).get("usd"),
+                "fdv":           pair.get("fdv"),
             }
     except Exception as e:
         return mint, None
@@ -89,18 +98,20 @@ def save_prices(results):
             if data:
                 cur.execute("""
                     UPDATE discovered_tokens SET
-                        price_usd = %s,
-                        market_cap = %s,
-                        volume_24h = %s,
-                        volume_1h = %s,
-                        volume_5m = %s,
-                        buys_24h = %s,
-                        sells_24h = %s,
-                        buys_1h = %s,
-                        sells_1h = %s,
-                        buys_5m = %s,
-                        sells_5m = %s,
-                        pair_address = %s,
+                        price_usd     = %s,
+                        market_cap    = %s,
+                        volume_24h    = %s,
+                        volume_1h     = %s,
+                        volume_5m     = %s,
+                        buys_24h      = %s,
+                        sells_24h     = %s,
+                        buys_1h       = %s,
+                        sells_1h      = %s,
+                        buys_5m       = %s,
+                        sells_5m      = %s,
+                        pair_address  = %s,
+                        liquidity_usd = %s,
+                        fdv           = %s,
                         price_updated_at = NOW()
                     WHERE mint = %s
                 """, (
@@ -109,7 +120,9 @@ def save_prices(results):
                     data["buys_24h"], data["sells_24h"],
                     data["buys_1h"], data["sells_1h"],
                     data["buys_5m"], data["sells_5m"],
-                    data["pair_address"], mint
+                    data["pair_address"],
+                    data["liquidity_usd"], data["fdv"],
+                    mint
                 ))
                 success += 1
         conn.commit()

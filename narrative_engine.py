@@ -66,13 +66,20 @@ def setup_db():
                 window_hours INTEGER DEFAULT 24,
                 calculated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
-            CREATE INDEX IF NOT EXISTS idx_narrative_stats_time 
+            CREATE INDEX IF NOT EXISTS idx_narrative_stats_time
                 ON narrative_stats(calculated_at DESC);
-            
-            ALTER TABLE discovered_tokens
-            ADD COLUMN IF NOT EXISTS narrative TEXT DEFAULT NULL;
         """)
         conn.commit()
+        try:
+            cur.execute("SET lock_timeout = '5s'")
+            cur.execute("""
+                ALTER TABLE discovered_tokens
+                ADD COLUMN IF NOT EXISTS narrative TEXT DEFAULT NULL
+            """)
+            conn.commit()
+        except Exception as e:
+            conn.rollback()
+            log.warning(f"ALTER TABLE skipped (lock timeout): {e}")
         cur.close()
         log.info("✅ Tablas de narrativas creadas")
     finally:

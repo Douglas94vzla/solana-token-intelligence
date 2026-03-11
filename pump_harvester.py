@@ -49,12 +49,14 @@ async def fetch_initial_price(mint):
                     return None
                 pair = max(pairs, key=lambda p: p.get("volume", {}).get("h24", 0))
                 return {
-                    "price_usd": pair.get("priceUsd"),
-                    "market_cap": pair.get("marketCap"),
-                    "volume_24h": pair.get("volume", {}).get("h24"),
-                    "buys_5m": pair.get("txns", {}).get("m5", {}).get("buys"),
-                    "sells_5m": pair.get("txns", {}).get("m5", {}).get("sells"),
-                    "pair_address": pair.get("pairAddress"),
+                    "price_usd":     pair.get("priceUsd"),
+                    "market_cap":    pair.get("marketCap"),
+                    "volume_24h":    pair.get("volume", {}).get("h24"),
+                    "buys_5m":       pair.get("txns", {}).get("m5", {}).get("buys"),
+                    "sells_5m":      pair.get("txns", {}).get("m5", {}).get("sells"),
+                    "pair_address":  pair.get("pairAddress"),
+                    "liquidity_usd": pair.get("liquidity", {}).get("usd"),
+                    "fdv":           pair.get("fdv"),
                 }
     except Exception as e:
         log.warning(f"Price fetch error para {mint}: {e}")
@@ -96,12 +98,14 @@ async def save_initial_price(mint):
         cur = conn.cursor()
         cur.execute("""
             UPDATE discovered_tokens SET
-                price_usd = %s,
-                market_cap = %s,
-                volume_24h = %s,
-                buys_5m = %s,
-                sells_5m = %s,
-                pair_address = %s,
+                price_usd     = %s,
+                market_cap    = %s,
+                volume_24h    = %s,
+                buys_5m       = %s,
+                sells_5m      = %s,
+                pair_address  = %s,
+                liquidity_usd = %s,
+                fdv           = %s,
                 price_updated_at = NOW()
             WHERE mint = %s
         """, (
@@ -111,6 +115,8 @@ async def save_initial_price(mint):
             price_data["buys_5m"],
             price_data["sells_5m"],
             price_data["pair_address"],
+            price_data["liquidity_usd"],
+            price_data["fdv"],
             mint
         ))
         conn.commit()

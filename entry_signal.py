@@ -31,8 +31,9 @@ pool = psycopg2.pool.ThreadedConnectionPool(
 
 MODEL_PATH = '/root/solana_bot/model.pkl'
 FEATURES_PATH = '/root/solana_bot/features.pkl'
-ML_THRESHOLD = 0.65   # Probabilidad mínima para ENTER
-RUG_THRESHOLD = 60    # Rug score máximo permitido
+ML_THRESHOLD      = 0.65    # Probabilidad mínima para ENTER
+RUG_THRESHOLD     = 60     # Rug score máximo permitido
+MIN_LIQUIDITY_USD = 10_000 # Liquidez mínima en USD para abrir trade
 
 # ── CARGAR MODELO ML ──────────────────────────────────
 def load_ml_model():
@@ -260,16 +261,53 @@ def is_rug_safe(mint):
     conn = pool.getconn()
     try:
         cur = conn.cursor()
-        cur.execute("""
-            SELECT rug_score FROM discovered_tokens WHERE mint = %s
-        """, (mint,))
+        cur.execute("SELECT rug_score FROM discovered_tokens WHERE mint = %s", (mint,))
         row = cur.fetchone()
         cur.close()
         if not row or row[0] is None:
             return True  # Sin datos = no bloqueamos
-        rug_score = row[0]
-        return (rug_score or 0) < RUG_THRESHOLD
-        
+        return (row[0] or 0) < RUG_THRESHOLD
+    finally:
+        pool.putconn(conn)
+
+def check_quality_filters(mint):
+    """
+    Aplica filtros de calidad en una sola query DB.
+    Retorna (bloqueado: bool, motivo: str).
+
+    Filtros (en orden de prioridad):
+      1. ONLY_0_HOLDERS en rug_flags  → hard block
+      2. liquidity_usd < MIN_LIQUIDITY_USD → block
+      3. Sin ninguna red social       → block
+    """
+    conn = pool.getconn()
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT rug_flags, liquidity_usd, twitter, telegram, website
+            FROM discovered_tokens WHERE mint = %s
+        """, (mint,))
+        row = cur.fetchone()
+        cur.close()
+        if not row:
+            return False, ''
+
+        rug_flags, liquidity_usd, twitter, telegram, website = row
+
+        # 1) ONLY_0_HOLDERS — hard block
+        if rug_flags and 'ONLY_0_HOLDERS' in rug_flags:
+            return True, 'ONLY_0_HOLDERS (sin holders on-chain)'
+
+        # 2) Liquidez mínima
+        liq = float(liquidity_usd) if liquidity_usd is not None else 0.0
+        if liq < MIN_LIQUIDITY_USD:
+            return True, f'liquidez insuficiente (${liq:,.0f} < ${MIN_LIQUIDITY_USD:,})'
+
+        # 3) Sin presencia social
+        if not twitter and not telegram and not website:
+            return True, 'sin presencia social (twitter/telegram/website)'
+
+        return False, ''
     finally:
         pool.putconn(conn)
 
@@ -371,6 +409,13 @@ async def monitor_cycle():
                 if signal == 'ENTER' and not is_rug_safe(mint):
                     log.info(f"🛡️  RUG BLOQUEADO | {name or mint[:8]} | rug_score alto")
                     signal = 'WAIT'
+
+                # ── FILTROS DE CALIDAD ────────────────────────
+                if signal == 'ENTER':
+                    blocked, reason = check_quality_filters(mint)
+                    if blocked:
+                        log.info(f"🚫 CALIDAD BLOQUEADO | {name or mint[:8]} | {reason}")
+                        signal = 'WAIT'
 
                 # ── FILTRO ML ─────────────────────────────────
                 ml_prob, ml_ok = ml_predict(mint)

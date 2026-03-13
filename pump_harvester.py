@@ -343,8 +343,8 @@ async def connect_and_listen(idx: int) -> str:
                                 mint = log_line.split("mint:")[1].split(",")[0].strip()
                                 await save_token(mint)
 
-    except websockets.exceptions.RejectHandshake as e:
-        return f"HTTP {e.status_code}"
+    except websockets.exceptions.InvalidStatus as e:       # websockets >= 14
+        return f"HTTP {e.response.status_code}"
     except websockets.exceptions.InvalidStatusCode as e:   # websockets < 14 compat
         return f"HTTP {e.status_code}"
     except (websockets.exceptions.ConnectionClosedError,

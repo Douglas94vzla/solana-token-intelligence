@@ -370,10 +370,10 @@ def get_watchlist():
             SELECT mint, name, symbol, survival_score, price_usd, market_cap
             FROM discovered_tokens
             WHERE signal IN ('STRONG_BUY', 'BUY')
-            AND created_at > NOW() - INTERVAL '6 hours'
+            AND created_at > NOW() - INTERVAL '90 minutes'
             AND price_usd IS NOT NULL
             ORDER BY survival_score DESC
-            LIMIT 50
+            LIMIT 100
         """)
         rows = cur.fetchall()
         cur.close()

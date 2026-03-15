@@ -44,6 +44,9 @@ FEES                  = 0.005    # 0.5% fees
 TRADE_HOURS_UTC       = (13, 23) # Solo abrir trades entre 13h y 23h UTC
 POSITION_CHECK_INTERVAL = 10     # Revisar posiciones abiertas cada 10s
 SIGNAL_CHECK_INTERVAL   = 60     # Buscar señales nuevas cada 60s
+STOP_LOSS_MIN         = 0.85     # Stop adaptativo mínimo: -15%
+STOP_LOSS_MAX         = 0.70     # Stop adaptativo máximo: -30%
+TRAILING_REENTRY_COOLDOWN = 15   # Minutos de espera antes de re-entrada tras trailing stop
 
 def setup_db():
     conn = pool.getconn()
@@ -84,10 +87,11 @@ def setup_db():
             SELECT 1000.0 WHERE NOT EXISTS (SELECT 1 FROM paper_capital);
         """)
         conn.commit()
-        # Añadir peak_price si no existe (migración)
+        # Migraciones de columnas
         try:
             cur.execute("SET lock_timeout = '5s'")
             cur.execute("ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS peak_price NUMERIC(20,10)")
+            cur.execute("ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS stop_loss_pct NUMERIC(6,4)")
             conn.commit()
         except Exception:
             conn.rollback()
@@ -134,11 +138,12 @@ def get_open_trades():
         cur.execute("""
             SELECT id, mint, name, symbol, entry_price, trade_size,
                    ml_probability, survival_score, opened_at,
-                   COALESCE(peak_price, entry_price) as peak_price
+                   COALESCE(peak_price, entry_price) as peak_price,
+                   COALESCE(stop_loss_pct, %s) as stop_loss_pct
             FROM paper_trades
             WHERE status = 'OPEN'
             ORDER BY opened_at ASC
-        """)
+        """, (STOP_LOSS,))
         rows = cur.fetchall()
         cur.close()
         return rows
@@ -156,9 +161,51 @@ def update_peak_price(trade_id, peak_price):
     finally:
         pool.putconn(conn)
 
-def open_trade(mint, name, symbol, price, ml_prob, score, narrative, capital):
-    trade_size  = round(capital * TRADE_SIZE_PCT, 2)
+def kelly_size(ml_prob, capital):
+    """
+    Half-Kelly position sizing basado en probabilidad ML.
+    b = ratio ganancia/pérdida esperado (TAKE_PROFIT gain / STOP_LOSS loss).
+    Retorna (trade_size_usd, pct_aplicado).
+    Clampado entre 1% y 5% del capital.
+    """
+    p = (ml_prob or 65) / 100.0
+    b = (TAKE_PROFIT - 1) / (1 - STOP_LOSS)   # 0.50 / 0.30 ≈ 1.667
+    kelly_f    = (p * b - (1 - p)) / b
+    half_kelly = max(0.0, kelly_f / 2.0)
+    pct        = max(0.01, min(0.05, half_kelly))
+    return round(capital * pct, 2), round(pct * 100, 1)
+
+def calc_adaptive_stop(mint):
+    """
+    Stop-loss dinámico basado en ATR de los últimos snapshots.
+    Stop distance = 2.5x ATR, clamped entre -15% y -30%.
+    Retorna multiplicador: ej. 0.80 → stop en -20%.
+    """
+    conn = pool.getconn()
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT price_usd FROM price_snapshots
+            WHERE mint = %s AND price_usd > 0
+            ORDER BY snapshot_at DESC LIMIT 10
+        """, (mint,))
+        prices = [float(r[0]) for r in cur.fetchall()]
+        cur.close()
+    finally:
+        pool.putconn(conn)
+
+    if len(prices) < 3:
+        return STOP_LOSS  # fallback al default -30%
+
+    changes  = [abs(prices[i] - prices[i+1]) / prices[i+1]
+                for i in range(len(prices) - 1)]
+    atr      = sum(changes) / len(changes)
+    stop_dist = min(1 - STOP_LOSS_MAX, max(1 - STOP_LOSS_MIN, atr * 2.5))
+    return round(1.0 - stop_dist, 4)
+
+def open_trade(mint, name, symbol, price, ml_prob, score, narrative, trade_size):
     entry_price = float(price) * (1 + SLIPPAGE + FEES)
+    stop_pct    = calc_adaptive_stop(mint)
 
     conn = pool.getconn()
     try:
@@ -166,17 +213,19 @@ def open_trade(mint, name, symbol, price, ml_prob, score, narrative, capital):
         cur.execute("""
             INSERT INTO paper_trades
             (mint, name, symbol, entry_price, peak_price, trade_size,
-             ml_probability, survival_score, narrative, status)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 'OPEN')
+             ml_probability, survival_score, narrative, stop_loss_pct, status)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'OPEN')
             RETURNING id
         """, (mint, name, symbol, entry_price, entry_price, trade_size,
-              ml_prob, score, narrative))
+              ml_prob, score, narrative, stop_pct))
         trade_id = cur.fetchone()[0]
         conn.commit()
         cur.close()
 
+        stop_pct_display = round((1 - stop_pct) * 100, 1)
         log.info(f"📝 PAPER TRADE ABIERTO #{trade_id} | {name or mint[:8]} | "
-                 f"Entrada: ${entry_price:.8f} | Size: ${trade_size}")
+                 f"Entrada: ${entry_price:.8f} | Size: ${trade_size} | "
+                 f"Stop: -{stop_pct_display}% | ML: {ml_prob}%")
         alert_paper_trade("OPEN", name, mint, entry_price)
         return trade_id
     finally:
@@ -238,7 +287,10 @@ def check_new_signals():
               AND dt.mint NOT IN (
                   SELECT mint FROM paper_trades
                   WHERE status = 'OPEN'
-                  OR opened_at > NOW() - INTERVAL '2 hours'
+                     OR (exit_reason IN ('STOP_LOSS', 'TAKE_PROFIT', 'TIMEOUT')
+                         AND opened_at > NOW() - INTERVAL '2 hours')
+                     OR (exit_reason = 'TRAILING_STOP'
+                         AND closed_at > NOW() - INTERVAL '15 minutes')
               )
             ORDER BY dt.ml_probability DESC
             LIMIT 5
@@ -345,7 +397,7 @@ def manage_open_trades(cap):
     open_trades = get_open_trades()
     for trade in open_trades:
         tid, mint, name, symbol, entry_price, trade_size, \
-            ml_prob, score, opened_at, peak_price = trade
+            ml_prob, score, opened_at, peak_price, stop_loss_pct = trade
 
         current_price = get_current_price(mint)
         if not current_price:
@@ -390,8 +442,8 @@ def manage_open_trades(cap):
             cap['wins' if pnl > 0 else 'losses'] += 1
             update_capital(**cap)
 
-        # ── STOP LOSS FIJO ─────────────────────────
-        elif current_price <= entry * STOP_LOSS:
+        # ── STOP LOSS ADAPTATIVO ───────────────────
+        elif current_price <= entry * float(stop_loss_pct):
             pnl, pnl_pct = close_trade(
                 tid, mint, name, entry_price,
                 float(trade_size), current_price, "STOP_LOSS"
@@ -463,9 +515,11 @@ def run():
                             mint, name, symbol, price, ml_prob, score, narrative = sig
                             if price:
                                 cap = get_capital()
+                                trade_size, size_pct = kelly_size(ml_prob or 65, cap['capital'])
+                                log.info(f"💰 Kelly sizing: {size_pct:.1f}% = ${trade_size:.2f} (ML={ml_prob}%)")
                                 open_trade(mint, name, symbol, price,
-                                           ml_prob, score, narrative, cap['capital'])
-                                cap['capital'] -= cap['capital'] * TRADE_SIZE_PCT
+                                           ml_prob, score, narrative, trade_size)
+                                cap['capital'] -= trade_size
                                 update_capital(**cap)
                 else:
                     hour = datetime.now(timezone.utc).hour

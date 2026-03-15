@@ -438,16 +438,17 @@ def run():
                 reset_daily_pnl()
                 last_daily_reset = datetime.now().date()
 
-            # ── LÍMITE DIARIO ──────────────────────────────
-            if is_daily_limit_hit():
-                log.warning("⛔ Límite de pérdida diaria alcanzado — pausando")
-                time.sleep(3600)
-                continue
-
             cap = get_capital()
 
             # ── GESTIONAR POSICIONES ABIERTAS (cada 10s) ───
+            # SIEMPRE gestionar posiciones abiertas, incluso con límite diario activo
             cap = manage_open_trades(cap)
+
+            # ── LÍMITE DIARIO — bloquea solo apertura de nuevos trades ──
+            if is_daily_limit_hit():
+                log.warning("⛔ Límite de pérdida diaria alcanzado — no se abren nuevos trades")
+                time.sleep(POSITION_CHECK_INTERVAL)
+                continue
 
             # ── ABRIR NUEVOS TRADES (cada 60s) ─────────────
             if now - last_signal_check >= SIGNAL_CHECK_INTERVAL:

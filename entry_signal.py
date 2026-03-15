@@ -365,7 +365,7 @@ def check_quality_filters(mint):
         pool.putconn(conn)
 
 def compute_entry_signal(current, history):
-    """Señal de momentum — igual que antes"""
+    """Señal de momentum con detección de pump burst (mejora 12)."""
     if not history or len(history) < 2:
         return 'WAIT', 0
 
@@ -376,18 +376,32 @@ def compute_entry_signal(current, history):
     if len(prices) < 2:
         return 'WAIT', 0
 
-    price_up          = prices[0] > prices[1]
+    price_up           = prices[0] > prices[1]
     price_acceleration = (prices[0] - prices[1]) / prices[1] * 100 if prices[1] > 0 else 0
-    buy_pressure      = buys[0] > sells[0] if buys and sells else False
-    buy_ratio         = buys[0] / (buys[0] + sells[0]) if buys and (buys[0] + sells[0]) > 0 else 0
+    buy_pressure       = buys[0] > sells[0] if buys and sells else False
+    buy_ratio          = buys[0] / (buys[0] + sells[0]) if buys and (buys[0] + sells[0]) > 0 else 0
+
+    # ── PUMP BURST DETECTOR ────────────────────────────────────
+    # Cuenta cuántos snapshots consecutivos tienen precio subiendo.
+    # 3+ consecutivos = señal de pump coordinado.
+    consecutive_up = 0
+    for i in range(len(prices) - 1):
+        if prices[i] > prices[i + 1]:
+            consecutive_up += 1
+        else:
+            break
 
     momentum = 0
-    if price_up:           momentum += 30
-    if price_acceleration > 5:  momentum += 20
-    elif price_acceleration > 2: momentum += 10
-    if buy_pressure:       momentum += 25
-    if buy_ratio > 0.7:    momentum += 25
-    elif buy_ratio > 0.5:  momentum += 10
+    if price_up:                  momentum += 30
+    if price_acceleration > 5:    momentum += 20
+    elif price_acceleration > 2:  momentum += 10
+    if buy_pressure:              momentum += 25
+    if buy_ratio > 0.7:           momentum += 25
+    elif buy_ratio > 0.5:         momentum += 10
+
+    # Pump burst bonus
+    if consecutive_up >= 4:       momentum += 30   # fuerte: 4+ snapshots subiendo
+    elif consecutive_up >= 3:     momentum += 15   # moderado: 3 consecutivos
 
     if momentum >= 70:     return 'ENTER', momentum
     elif momentum >= 40:   return 'WATCH', momentum

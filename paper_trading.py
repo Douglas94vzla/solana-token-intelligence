@@ -39,7 +39,7 @@ TRAIL_PCT             = 0.20     # Trailing: cierra si cae 20% desde el pico
 TRAIL_ACTIVATE        = 0.10     # Trailing activa solo si el trade subió 10%+
 MAX_HOLD_MINUTES      = 120      # Timeout 2 horas
 DAILY_LOSS_LIMIT      = 0.03     # Parar si perdemos 3% en el día
-SLIPPAGE              = 0.03     # 3% slippage simulado
+SLIPPAGE              = 0.03     # Slippage base (fallback si no hay liquidez)
 FEES                  = 0.005    # 0.5% fees
 TRADE_HOURS_UTC       = (13, 23) # Solo abrir trades entre 13h y 23h UTC
 POSITION_CHECK_INTERVAL = 10     # Revisar posiciones abiertas cada 10s
@@ -47,6 +47,30 @@ SIGNAL_CHECK_INTERVAL   = 60     # Buscar señales nuevas cada 60s
 STOP_LOSS_MIN         = 0.85     # Stop adaptativo mínimo: -15%
 STOP_LOSS_MAX         = 0.70     # Stop adaptativo máximo: -30%
 TRAILING_REENTRY_COOLDOWN = 15   # Minutos de espera antes de re-entrada tras trailing stop
+
+# ── MULTI-STRATEGY CONFIG (mejora 14) ─────────────────
+# Cada estrategia corre en paralelo con su propio capital virtual.
+# STANDARD = cuenta principal (paper_capital). Las otras son simulaciones.
+STRATEGIES = {
+    'CONSERVATIVE': {
+        'ml_min':         80,       # Solo señales de muy alta confianza
+        'max_open':        2,       # Máximo 2 trades simultáneos
+        'size_pct':       0.01,     # 1% fijo por trade (preservar capital)
+        'initial_capital': 333.0,   # Capital inicial de la estrategia
+    },
+    'STANDARD': {
+        'ml_min':         65,       # Filtro ML actual
+        'max_open':        3,       # Máximo 3 trades (existente)
+        'size_pct':       None,     # Usa Kelly sizing
+        'initial_capital': 333.0,   # Capital inicial de la estrategia
+    },
+    'AGGRESSIVE': {
+        'ml_min':         65,       # Mismo filtro ML
+        'max_open':        3,       # Máximo 3 trades
+        'size_pct':       0.05,     # 5% fijo (apuesta mayor en cada trade)
+        'initial_capital': 333.0,   # Capital inicial de la estrategia
+    },
+}
 
 def setup_db():
     conn = pool.getconn()
@@ -87,11 +111,32 @@ def setup_db():
             SELECT 1000.0 WHERE NOT EXISTS (SELECT 1 FROM paper_capital);
         """)
         conn.commit()
+        # Tabla de capital por estrategia (mejora 14)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS strategy_capital (
+                strategy         TEXT PRIMARY KEY,
+                capital          NUMERIC(20,2) DEFAULT 333.0,
+                initial_capital  NUMERIC(20,2) DEFAULT 333.0,
+                wins             INTEGER DEFAULT 0,
+                losses           INTEGER DEFAULT 0,
+                total_pnl        NUMERIC(20,2) DEFAULT 0,
+                updated_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        # Poblar estrategias si no existen
+        for strat, cfg in STRATEGIES.items():
+            cur.execute("""
+                INSERT INTO strategy_capital (strategy, capital, initial_capital)
+                VALUES (%s, %s, %s) ON CONFLICT (strategy) DO NOTHING
+            """, (strat, cfg['initial_capital'], cfg['initial_capital']))
+        conn.commit()
         # Migraciones de columnas
         try:
             cur.execute("SET lock_timeout = '5s'")
             cur.execute("ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS peak_price NUMERIC(20,10)")
             cur.execute("ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS stop_loss_pct NUMERIC(6,4)")
+            cur.execute("ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS strategy TEXT DEFAULT 'STANDARD'")
+            cur.execute("ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS slippage_pct NUMERIC(6,4)")
             conn.commit()
         except Exception:
             conn.rollback()
@@ -131,19 +176,32 @@ def update_capital(capital, daily_pnl, total_pnl, wins, losses):
     finally:
         pool.putconn(conn)
 
-def get_open_trades():
+def get_open_trades(strategy=None):
     conn = pool.getconn()
     try:
         cur = conn.cursor()
-        cur.execute("""
-            SELECT id, mint, name, symbol, entry_price, trade_size,
-                   ml_probability, survival_score, opened_at,
-                   COALESCE(peak_price, entry_price) as peak_price,
-                   COALESCE(stop_loss_pct, %s) as stop_loss_pct
-            FROM paper_trades
-            WHERE status = 'OPEN'
-            ORDER BY opened_at ASC
-        """, (STOP_LOSS,))
+        if strategy:
+            cur.execute("""
+                SELECT id, mint, name, symbol, entry_price, trade_size,
+                       ml_probability, survival_score, opened_at,
+                       COALESCE(peak_price, entry_price) as peak_price,
+                       COALESCE(stop_loss_pct, %s) as stop_loss_pct,
+                       COALESCE(strategy, 'STANDARD') as strategy
+                FROM paper_trades
+                WHERE status = 'OPEN' AND COALESCE(strategy, 'STANDARD') = %s
+                ORDER BY opened_at ASC
+            """, (STOP_LOSS, strategy))
+        else:
+            cur.execute("""
+                SELECT id, mint, name, symbol, entry_price, trade_size,
+                       ml_probability, survival_score, opened_at,
+                       COALESCE(peak_price, entry_price) as peak_price,
+                       COALESCE(stop_loss_pct, %s) as stop_loss_pct,
+                       COALESCE(strategy, 'STANDARD') as strategy
+                FROM paper_trades
+                WHERE status = 'OPEN'
+                ORDER BY opened_at ASC
+            """, (STOP_LOSS,))
         rows = cur.fetchall()
         cur.close()
         return rows
@@ -175,6 +233,56 @@ def kelly_size(ml_prob, capital):
     pct        = max(0.01, min(0.05, half_kelly))
     return round(capital * pct, 2), round(pct * 100, 1)
 
+def dynamic_slippage(trade_size, liquidity_usd):
+    """
+    Mejora 13: Slippage variable basado en liquidez real de DexScreener.
+    trade_size / liquidity_usd = impacto de mercado estimado.
+    Ej: $20 trade en pool de $5k → slippage = 20/5000 = 0.4% (mucho mejor que 3% fijo)
+    Ej: $20 trade en pool de $200 → slippage = 10% (realista para tokens micro-cap)
+    Clampado entre 0.5% y 30%.
+    """
+    if not liquidity_usd or liquidity_usd <= 0:
+        return SLIPPAGE   # fallback al 3% base
+    slip = trade_size / max(float(liquidity_usd), 1.0)
+    return round(min(0.30, max(0.005, slip)), 4)
+
+def get_strategy_capital(strategy):
+    conn = pool.getconn()
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT capital, initial_capital, wins, losses, total_pnl
+            FROM strategy_capital WHERE strategy = %s
+        """, (strategy,))
+        row = cur.fetchone()
+        cur.close()
+        if not row:
+            return None
+        return {
+            'capital':         float(row[0]),
+            'initial_capital': float(row[1]),
+            'wins':            row[2],
+            'losses':          row[3],
+            'total_pnl':       float(row[4]),
+        }
+    finally:
+        pool.putconn(conn)
+
+def update_strategy_capital(strategy, capital, wins, losses, total_pnl):
+    conn = pool.getconn()
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            UPDATE strategy_capital SET
+                capital = %s, wins = %s, losses = %s,
+                total_pnl = %s, updated_at = NOW()
+            WHERE strategy = %s
+        """, (capital, wins, losses, total_pnl, strategy))
+        conn.commit()
+        cur.close()
+    finally:
+        pool.putconn(conn)
+
 def calc_adaptive_stop(mint):
     """
     Stop-loss dinámico basado en ATR de los últimos snapshots.
@@ -203,8 +311,10 @@ def calc_adaptive_stop(mint):
     stop_dist = min(1 - STOP_LOSS_MAX, max(1 - STOP_LOSS_MIN, atr * 2.5))
     return round(1.0 - stop_dist, 4)
 
-def open_trade(mint, name, symbol, price, ml_prob, score, narrative, trade_size):
-    entry_price = float(price) * (1 + SLIPPAGE + FEES)
+def open_trade(mint, name, symbol, price, ml_prob, score, narrative, trade_size,
+               strategy='STANDARD', liquidity_usd=None):
+    slip        = dynamic_slippage(trade_size, liquidity_usd)   # mejora 13
+    entry_price = float(price) * (1 + slip + FEES)
     stop_pct    = calc_adaptive_stop(mint)
 
     conn = pool.getconn()
@@ -213,20 +323,23 @@ def open_trade(mint, name, symbol, price, ml_prob, score, narrative, trade_size)
         cur.execute("""
             INSERT INTO paper_trades
             (mint, name, symbol, entry_price, peak_price, trade_size,
-             ml_probability, survival_score, narrative, stop_loss_pct, status)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'OPEN')
+             ml_probability, survival_score, narrative, stop_loss_pct,
+             strategy, slippage_pct, status)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'OPEN')
             RETURNING id
         """, (mint, name, symbol, entry_price, entry_price, trade_size,
-              ml_prob, score, narrative, stop_pct))
+              ml_prob, score, narrative, stop_pct, strategy, slip))
         trade_id = cur.fetchone()[0]
         conn.commit()
         cur.close()
 
         stop_pct_display = round((1 - stop_pct) * 100, 1)
-        log.info(f"📝 PAPER TRADE ABIERTO #{trade_id} | {name or mint[:8]} | "
+        slip_pct_display = round(slip * 100, 2)
+        log.info(f"📝 [{strategy}] TRADE ABIERTO #{trade_id} | {name or mint[:8]} | "
                  f"Entrada: ${entry_price:.8f} | Size: ${trade_size} | "
-                 f"Stop: -{stop_pct_display}% | ML: {ml_prob}%")
-        alert_paper_trade("OPEN", name, mint, entry_price)
+                 f"Slippage: {slip_pct_display}% | Stop: -{stop_pct_display}% | ML: {ml_prob}%")
+        if strategy == 'STANDARD':
+            alert_paper_trade("OPEN", name, mint, entry_price)
         return trade_id
     finally:
         pool.putconn(conn)
@@ -260,7 +373,8 @@ def get_current_price(mint):
 
     return None
 
-def close_trade(trade_id, mint, name, entry_price, trade_size, current_price, reason):
+def close_trade(trade_id, mint, name, entry_price, trade_size, current_price, reason,
+                strategy='STANDARD'):
     exit_price = current_price * (1 - FEES)
     entry      = float(entry_price)
     pnl_pct    = (exit_price - entry) / entry * 100
@@ -278,24 +392,28 @@ def close_trade(trade_id, mint, name, entry_price, trade_size, current_price, re
         conn.commit()
         cur.close()
 
-        log.info(f"{'✅' if pnl > 0 else '❌'} PAPER TRADE CERRADO #{trade_id} | "
+        emoji = '✅' if pnl > 0 else '❌'
+        log.info(f"{emoji} [{strategy}] TRADE CERRADO #{trade_id} | "
                  f"{name or mint[:8]} | P&L: ${pnl:+.2f} ({pnl_pct:+.1f}%) | {reason}")
-        alert_paper_trade("CLOSE", name, mint, exit_price,
-                          pnl=pnl, pnl_pct=pnl_pct, reason=reason)
+        if strategy == 'STANDARD':
+            alert_paper_trade("CLOSE", name, mint, exit_price,
+                              pnl=pnl, pnl_pct=pnl_pct, reason=reason)
         return pnl, pnl_pct
     finally:
         pool.putconn(conn)
 
-def check_new_signals():
+def check_new_signals(ml_min=65):
+    """Retorna señales ENTER con ml_probability >= ml_min, incluyendo liquidity_usd."""
     conn = pool.getconn()
     try:
         cur = conn.cursor()
         cur.execute("""
             SELECT dt.mint, dt.name, dt.symbol, dt.price_usd,
-                   dt.ml_probability, dt.survival_score, dt.narrative
+                   dt.ml_probability, dt.survival_score, dt.narrative,
+                   dt.liquidity_usd
             FROM discovered_tokens dt
             WHERE dt.entry_signal = 'ENTER'
-              AND dt.ml_probability >= 65
+              AND dt.ml_probability >= %s
               AND dt.entry_at > NOW() - INTERVAL '30 minutes'
               AND dt.market_cap >= 10000
               AND (dt.liquidity_usd >= 5000 OR (dt.liquidity_usd IS NULL AND dt.market_cap >= 20000))
@@ -309,7 +427,7 @@ def check_new_signals():
               )
             ORDER BY dt.ml_probability DESC
             LIMIT 5
-        """)
+        """, (ml_min,))
         rows = cur.fetchall()
         cur.close()
         return rows
@@ -385,9 +503,9 @@ def print_summary():
                    COALESCE(MAX(pnl_pct), 0),
                    COALESCE(MIN(pnl_pct), 0)
             FROM paper_trades WHERE status = 'CLOSED'
+              AND COALESCE(strategy, 'STANDARD') = 'STANDARD'
         """)
         row = cur.fetchone()
-        cur.close()
         total, wins, losses, total_pnl, avg_pct, best, worst = row
         win_rate = (wins / total * 100) if total > 0 else 0
 
@@ -403,16 +521,60 @@ def print_summary():
         print(f"  Avg P&L:          {float(avg_pct):+.1f}%")
         print(f"  Mejor trade:      {float(best):+.1f}%")
         print(f"  Peor trade:       {float(worst):+.1f}%")
+        print("="*60)
+
+        # ── MULTI-STRATEGY COMPARISON (mejora 14) ─────────
+        print("\n  RENDIMIENTO POR ESTRATEGIA:")
+        print(f"  {'Estrategia':<14} {'Capital':>10} {'ROI':>8} {'Trades':>7} {'WR':>6}")
+        print(f"  {'-'*48}")
+        for strat_name, scfg in STRATEGIES.items():
+            if strat_name == 'STANDARD':
+                s_cap  = cap['capital']
+                s_init = INITIAL_CAPITAL
+            else:
+                scap   = get_strategy_capital(strat_name)
+                s_cap  = scap['capital'] if scap else scfg['initial_capital']
+                s_init = scfg['initial_capital']
+            cur.execute("""
+                SELECT COUNT(*), COUNT(CASE WHEN pnl > 0 THEN 1 END)
+                FROM paper_trades WHERE status = 'CLOSED'
+                  AND COALESCE(strategy, 'STANDARD') = %s
+            """, (strat_name,))
+            sr = cur.fetchone()
+            s_trades = sr[0] if sr else 0
+            s_wins   = sr[1] if sr else 0
+            s_wr     = (s_wins / s_trades * 100) if s_trades > 0 else 0
+            s_roi    = (s_cap - s_init) / s_init * 100
+            print(f"  {strat_name:<14} ${s_cap:>8.2f} {s_roi:>+7.1f}% {s_trades:>6} {s_wr:>5.0f}%")
         print("="*60 + "\n")
+        cur.close()
     finally:
         pool.putconn(conn)
+
+def _apply_pnl_to_cap(cap, strategy, pnl, trade_size, is_win):
+    """Actualiza el capital correcto según la estrategia."""
+    if strategy == 'STANDARD':
+        cap['capital']   += float(trade_size) + pnl
+        cap['daily_pnl'] += pnl
+        cap['total_pnl'] += pnl
+        cap['wins' if is_win else 'losses'] += 1
+        update_capital(**cap)
+    else:
+        # Actualizar capital de la estrategia alternativa
+        scap = get_strategy_capital(strategy)
+        if scap:
+            scap['capital']   += float(trade_size) + pnl
+            scap['total_pnl'] += pnl
+            scap['wins' if is_win else 'losses'] += 1
+            update_strategy_capital(strategy, scap['capital'],
+                                    scap['wins'], scap['losses'], scap['total_pnl'])
 
 def manage_open_trades(cap):
     """Revisa y gestiona todas las posiciones abiertas. Llamado cada 10s."""
     open_trades = get_open_trades()
     for trade in open_trades:
         tid, mint, name, symbol, entry_price, trade_size, \
-            ml_prob, score, opened_at, peak_price, stop_loss_pct = trade
+            ml_prob, score, opened_at, peak_price, stop_loss_pct, strategy = trade
 
         current_price = get_current_price(mint)
         if not current_price:
@@ -430,57 +592,41 @@ def manage_open_trades(cap):
         if current_price >= entry * TAKE_PROFIT:
             pnl, pnl_pct = close_trade(
                 tid, mint, name, entry_price,
-                float(trade_size), current_price, "TAKE_PROFIT"
+                float(trade_size), current_price, "TAKE_PROFIT", strategy
             )
-            cap['capital']   += float(trade_size) + pnl
-            cap['daily_pnl'] += pnl
-            cap['total_pnl'] += pnl
-            cap['wins' if pnl > 0 else 'losses'] += 1
-            update_capital(**cap)
+            _apply_pnl_to_cap(cap, strategy, pnl, trade_size, pnl > 0)
 
         # ── TRAILING STOP ──────────────────────────
         # Activa solo si el trade subió TRAIL_ACTIVATE%+
         # Stop = peak * (1 - TRAIL_PCT)
         elif (peak >= entry * (1 + TRAIL_ACTIVATE) and
               current_price <= peak * (1 - TRAIL_PCT)):
-            trail_level = peak * (1 - TRAIL_PCT)
+            trail_level  = peak * (1 - TRAIL_PCT)
             gain_at_peak = (peak - entry) / entry * 100
-            log.info(f"🔔 TRAILING STOP #{tid} | Peak: +{gain_at_peak:.1f}% | "
+            log.info(f"🔔 TRAILING STOP #{tid} [{strategy}] | Peak: +{gain_at_peak:.1f}% | "
                      f"Trail: ${trail_level:.8f}")
             pnl, pnl_pct = close_trade(
                 tid, mint, name, entry_price,
-                float(trade_size), current_price, "TRAILING_STOP"
+                float(trade_size), current_price, "TRAILING_STOP", strategy
             )
-            cap['capital']   += float(trade_size) + pnl
-            cap['daily_pnl'] += pnl
-            cap['total_pnl'] += pnl
-            cap['wins' if pnl > 0 else 'losses'] += 1
-            update_capital(**cap)
+            _apply_pnl_to_cap(cap, strategy, pnl, trade_size, pnl > 0)
 
         # ── STOP LOSS ADAPTATIVO ───────────────────
         elif current_price <= entry * float(stop_loss_pct):
             pnl, pnl_pct = close_trade(
                 tid, mint, name, entry_price,
-                float(trade_size), current_price, "STOP_LOSS"
+                float(trade_size), current_price, "STOP_LOSS", strategy
             )
-            cap['capital']   += float(trade_size) + pnl
-            cap['daily_pnl'] += pnl
-            cap['total_pnl'] += pnl
-            cap['losses']    += 1
-            update_capital(**cap)
+            _apply_pnl_to_cap(cap, strategy, pnl, trade_size, False)
 
         # ── TIMEOUT ────────────────────────────────
         elif (datetime.now() - opened_at.replace(tzinfo=None) >
               timedelta(minutes=MAX_HOLD_MINUTES)):
             pnl, pnl_pct = close_trade(
                 tid, mint, name, entry_price,
-                float(trade_size), current_price, "TIMEOUT"
+                float(trade_size), current_price, "TIMEOUT", strategy
             )
-            cap['capital']   += float(trade_size) + pnl
-            cap['daily_pnl'] += pnl
-            cap['total_pnl'] += pnl
-            cap['wins' if pnl > 0 else 'losses'] += 1
-            update_capital(**cap)
+            _apply_pnl_to_cap(cap, strategy, pnl, trade_size, pnl > 0)
 
     return cap
 
@@ -521,21 +667,44 @@ def run():
             if now - last_signal_check >= SIGNAL_CHECK_INTERVAL:
                 last_signal_check = now
                 if is_trading_hours():
-                    open_trades = get_open_trades()
-                    if len(open_trades) < MAX_OPEN_TRADES:
-                        signals = check_new_signals()
-                        for sig in signals:
-                            if len(get_open_trades()) >= MAX_OPEN_TRADES:
-                                break
-                            mint, name, symbol, price, ml_prob, score, narrative = sig
-                            if price:
+                    # Señales ordenadas por ML prob (ml_min=65 es el filtro más amplio)
+                    signals = check_new_signals(ml_min=65)
+                    for sig in signals:
+                        mint, name, symbol, price, ml_prob, score, narrative, liquidity = sig
+                        if not price:
+                            continue
+                        # ── Evaluar cada estrategia para este token ───────
+                        for strat_name, scfg in STRATEGIES.items():
+                            if (ml_prob or 0) < scfg['ml_min']:
+                                continue
+                            open_count = len(get_open_trades(strategy=strat_name))
+                            if open_count >= scfg['max_open']:
+                                continue
+                            # Calcular tamaño según estrategia
+                            if strat_name == 'STANDARD':
                                 cap = get_capital()
-                                trade_size, size_pct = kelly_size(ml_prob or 65, cap['capital'])
-                                log.info(f"💰 Kelly sizing: {size_pct:.1f}% = ${trade_size:.2f} (ML={ml_prob}%)")
-                                open_trade(mint, name, symbol, price,
-                                           ml_prob, score, narrative, trade_size)
-                                cap['capital'] -= trade_size
+                                t_size, size_pct = kelly_size(ml_prob or 65, cap['capital'])
+                                log.info(f"💰 [{strat_name}] Kelly: {size_pct:.1f}% = ${t_size:.2f} | ML={ml_prob}%")
+                            else:
+                                scap = get_strategy_capital(strat_name)
+                                if not scap:
+                                    continue
+                                t_size = round(scap['capital'] * scfg['size_pct'], 2)
+                                log.info(f"💰 [{strat_name}] Fixed: {scfg['size_pct']*100:.0f}% = ${t_size:.2f} | ML={ml_prob}%")
+                            open_trade(mint, name, symbol, price,
+                                       ml_prob, score, narrative, t_size,
+                                       strategy=strat_name, liquidity_usd=liquidity)
+                            # Descontar capital de la estrategia correspondiente
+                            if strat_name == 'STANDARD':
+                                cap = get_capital()
+                                cap['capital'] -= t_size
                                 update_capital(**cap)
+                            else:
+                                scap = get_strategy_capital(strat_name)
+                                if scap:
+                                    scap['capital'] -= t_size
+                                    update_strategy_capital(strat_name, scap['capital'],
+                                                            scap['wins'], scap['losses'], scap['total_pnl'])
                 else:
                     hour = datetime.now(timezone.utc).hour
                     log.debug(f"🌙 Fuera de horario ({hour}h UTC) — no se abren nuevos trades")

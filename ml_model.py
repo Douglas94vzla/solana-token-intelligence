@@ -498,5 +498,13 @@ def run():
     log.info(f"✅ {name} | CV AUC: {cv_auc:.3f} | Test AUC: {test_auc:.3f}")
     log.info(f"   Target: +{TARGET_GAIN*100:.0f}% | Samples: {len(y)} | Features: {X.shape[1]}")
 
+    # ── BACKTEST AUTOMÁTICO POST-ENTRENAMIENTO ─────────
+    log.info("🔬 Lanzando backtest con nuevo modelo...")
+    try:
+        import backtester
+        backtester.run_backtest()
+    except Exception as e:
+        log.warning(f"Backtest post-training falló: {e}")
+
 if __name__ == "__main__":
     run()

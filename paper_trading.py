@@ -232,18 +232,33 @@ def open_trade(mint, name, symbol, price, ml_prob, score, narrative, trade_size)
         pool.putconn(conn)
 
 def get_current_price(mint):
+    # Fuente 1: DexScreener
     try:
         url  = f"https://api.dexscreener.com/latest/dex/tokens/{mint}"
         resp = requests.get(url, timeout=10)
         data = resp.json()
         pairs = data.get("pairs")
-        if not pairs:
-            return None
-        pair  = max(pairs, key=lambda p: p.get("volume", {}).get("h24", 0))
-        price = pair.get("priceUsd")
-        return float(price) if price else None
+        if pairs:
+            pair  = max(pairs, key=lambda p: p.get("volume", {}).get("h24", 0))
+            price = pair.get("priceUsd")
+            if price:
+                return float(price)
     except Exception:
-        return None
+        pass
+
+    # Fuente 2 (fallback): Jupiter Price API
+    try:
+        url  = f"https://api.jup.ag/price/v2?ids={mint}"
+        resp = requests.get(url, timeout=8)
+        data = resp.json()
+        price_data = data.get("data", {}).get(mint)
+        if price_data and price_data.get("price"):
+            log.debug(f"Jupiter fallback usado para {mint[:8]}")
+            return float(price_data["price"])
+    except Exception:
+        pass
+
+    return None
 
 def close_trade(trade_id, mint, name, entry_price, trade_size, current_price, reason):
     exit_price = current_price * (1 - FEES)

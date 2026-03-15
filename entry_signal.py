@@ -90,27 +90,50 @@ def setup_db():
         pool.putconn(conn)
 
 async def fetch_current_data(session, mint):
-    url = f"https://api.dexscreener.com/latest/dex/tokens/{mint}"
+    # Fuente 1: DexScreener (datos completos)
     try:
+        url = f"https://api.dexscreener.com/latest/dex/tokens/{mint}"
         async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
             data = await resp.json()
             pairs = data.get("pairs")
-            if not pairs:
-                return None
-            pair = max(pairs, key=lambda p: p.get("volume", {}).get("h24", 0))
-            return {
-                "price_usd":      pair.get("priceUsd"),
-                "market_cap":     pair.get("marketCap"),
-                "volume":         pair.get("volume", {}).get("h24", 0),
-                "buys_1h":        pair.get("txns", {}).get("h1", {}).get("buys", 0),
-                "sells_1h":       pair.get("txns", {}).get("h1", {}).get("sells", 0),
-                "buys_5m":        pair.get("txns", {}).get("m5", {}).get("buys", 0),
-                "sells_5m":       pair.get("txns", {}).get("m5", {}).get("sells", 0),
-                "price_change_5m": pair.get("priceChange", {}).get("m5", 0),
-                "price_change_1h": pair.get("priceChange", {}).get("h1", 0),
-            }
+            if pairs:
+                pair = max(pairs, key=lambda p: p.get("volume", {}).get("h24", 0))
+                price = pair.get("priceUsd")
+                if price:
+                    return {
+                        "price_usd":       price,
+                        "market_cap":      pair.get("marketCap"),
+                        "volume":          pair.get("volume", {}).get("h24", 0),
+                        "buys_1h":         pair.get("txns", {}).get("h1", {}).get("buys", 0),
+                        "sells_1h":        pair.get("txns", {}).get("h1", {}).get("sells", 0),
+                        "buys_5m":         pair.get("txns", {}).get("m5", {}).get("buys", 0),
+                        "sells_5m":        pair.get("txns", {}).get("m5", {}).get("sells", 0),
+                        "price_change_5m": pair.get("priceChange", {}).get("m5", 0),
+                        "price_change_1h": pair.get("priceChange", {}).get("h1", 0),
+                    }
     except Exception:
-        return None
+        pass
+
+    # Fuente 2 (fallback): Jupiter Price API (solo precio)
+    try:
+        url = f"https://api.jup.ag/price/v2?ids={mint}"
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=8)) as resp:
+            data = await resp.json()
+            price_data = data.get("data", {}).get(mint)
+            if price_data and price_data.get("price"):
+                log.debug(f"Jupiter fallback para {mint[:8]}")
+                return {
+                    "price_usd":       str(price_data["price"]),
+                    "market_cap":      None,
+                    "volume":          0,
+                    "buys_1h":         0, "sells_1h":  0,
+                    "buys_5m":         0, "sells_5m":  0,
+                    "price_change_5m": 0, "price_change_1h": 0,
+                }
+    except Exception:
+        pass
+
+    return None
 
 def save_snapshot(mint, data):
     conn = pool.getconn()

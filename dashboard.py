@@ -1,5 +1,6 @@
 import streamlit as st
 import psycopg2
+import psycopg2.pool
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
@@ -145,8 +146,9 @@ div[data-testid="stMetric"] {
 """, unsafe_allow_html=True)
 
 @st.cache_resource
-def get_connection():
-    return psycopg2.connect(
+def get_pool():
+    return psycopg2.pool.ThreadedConnectionPool(
+        1, 5,
         dbname=os.getenv("DB_NAME"),
         user=os.getenv("DB_USER"),
         password=os.getenv("DB_PASSWORD"),
@@ -154,17 +156,24 @@ def get_connection():
     )
 
 def query(sql, params=None):
-    conn = None
+    pool = get_pool()
+    conn = pool.getconn()
     try:
-        conn = get_connection()
-        result = pd.read_sql(sql, conn, params=params)
-        return result
+        with conn.cursor() as cur:
+            cur.execute(sql, params)
+            rows = cur.fetchall()
+            cols = [desc[0] for desc in cur.description] if cur.description else []
+        conn.commit()
+        return pd.DataFrame(rows, columns=cols)
     except Exception as e:
         st.error(f"DB Error: {e}")
+        try:
+            conn.rollback()
+        except Exception:
+            pass
         return pd.DataFrame()
     finally:
-        if conn:
-            conn.close()
+        pool.putconn(conn)
 
 # ── HEADER ──────────────────────────────────────────
 st.markdown('<div class="header-title">⚡ SOLANA INTELLIGENCE</div>', unsafe_allow_html=True)

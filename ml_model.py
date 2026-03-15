@@ -73,6 +73,19 @@ def load_training_data():
                 EXTRACT(HOUR FROM dt.created_at)        as launch_hour,
                 COALESCE(dt.liquidity_usd, 0)           as liquidity_usd,
                 COALESCE(dt.fdv, 0)                     as fdv,
+                -- Smart money: alguna wallet conocida compró este token
+                CASE WHEN EXISTS (
+                    SELECT 1 FROM wallet_activity wa
+                    JOIN smart_wallets sw ON sw.wallet = wa.wallet
+                    WHERE wa.mint = dt.mint AND sw.is_smart = TRUE
+                ) THEN 1 ELSE 0 END                     as smart_money_bought,
+                -- Narrative momentum: crecimiento de volumen de la narrativa
+                COALESCE((
+                    SELECT ns.momentum FROM narrative_stats ns
+                    WHERE ns.narrative = dt.narrative
+                      AND ns.window_hours = 24
+                    ORDER BY ns.calculated_at DESC LIMIT 1
+                ), 0)                                   as narrative_momentum,
                 MIN(ps.price_usd)                       as price_entry,
                 MAX(ps.price_usd)                       as price_max,
                 COUNT(ps.id)                            as snapshot_count,
@@ -107,6 +120,7 @@ def load_training_data():
             'rug_score', 'holder_count', 'top10_concentration',
             'dev_sold', 'has_twitter', 'has_telegram', 'has_website',
             'launch_hour', 'liquidity_usd', 'fdv',
+            'smart_money_bought', 'narrative_momentum',
             'price_entry', 'price_max', 'snapshot_count', 'target'
         ]
 
@@ -171,6 +185,18 @@ def engineer_features(df):
     df['log_fdv']            = np.log1p(df['fdv'])
     df['fdv_to_mcap']        = df['fdv'] / (df['market_cap'] + 1)
 
+    # Velocidad de actividad — aceleración vs promedio histórico de 24h
+    # buys_growth > 1 significa que los 5m actuales son más activos que la media
+    df['buys_growth']      = df['buys_5m']  / (df['buys_24h']  / 288.0 + 1)
+    df['sells_growth']     = df['sells_5m'] / (df['sells_24h'] / 288.0 + 1)
+    df['buy_acceleration'] = df['buys_1h']  / (df['buys_24h']  / 24.0  + 1)
+    df['vol_growth_1h']    = df['volume_1h'] / (df['volume_24h'] / 24.0  + 1)
+    df['vol_growth_5m']    = df['volume_5m'] / (df['volume_24h'] / 288.0 + 1)
+
+    # Smart money y narrativa (ya vienen de la query, solo aseguramos tipos)
+    df['smart_money_bought']  = df['smart_money_bought'].fillna(0).astype(int)
+    df['narrative_momentum']  = pd.to_numeric(df['narrative_momentum'], errors='coerce').fillna(0)
+
     return df, le
 
 def get_feature_columns():
@@ -195,6 +221,11 @@ def get_feature_columns():
         # Liquidity
         'liquidity_usd', 'log_liquidity', 'liquidity_to_mcap',
         'fdv', 'log_fdv', 'fdv_to_mcap',
+        # Velocidad de actividad
+        'buys_growth', 'sells_growth', 'buy_acceleration',
+        'vol_growth_1h', 'vol_growth_5m',
+        # Señales externas
+        'smart_money_bought', 'narrative_momentum',
     ]
 
 def train_models(X, y):

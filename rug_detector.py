@@ -97,23 +97,24 @@ def get_token_mint_info(mint):
         return {}
 
 def get_recent_large_sells(mint):
-    """Detecta ventas grandes recientes usando DexScreener"""
+    """Detecta ventas grandes recientes usando DexScreener. Retorna también liquidez y volumen."""
     try:
         url = f"https://api.dexscreener.com/latest/dex/tokens/{mint}"
         resp = requests.get(url, timeout=8).json()
         pairs = resp.get("pairs")
         if not pairs:
-            return False, 0, 0
+            return False, 0, 0, 0, 0
         pair = max(pairs, key=lambda p: p.get("volume", {}).get("h24", 0))
-        buys_5m  = pair.get("txns", {}).get("m5", {}).get("buys", 0)
-        sells_5m = pair.get("txns", {}).get("m5", {}).get("sells", 0)
-        buys_1h  = pair.get("txns", {}).get("h1", {}).get("buys", 0)
-        sells_1h = pair.get("txns", {}).get("h1", {}).get("sells", 0)
-        # Señal de dump: ventas superan compras significativamente
+        buys_5m   = pair.get("txns", {}).get("m5", {}).get("buys", 0)
+        sells_5m  = pair.get("txns", {}).get("m5", {}).get("sells", 0)
+        buys_1h   = pair.get("txns", {}).get("h1", {}).get("buys", 0)
+        sells_1h  = pair.get("txns", {}).get("h1", {}).get("sells", 0)
+        volume_24h = pair.get("volume", {}).get("h24", 0) or 0
+        liquidity  = (pair.get("liquidity") or {}).get("usd", 0) or 0
         sell_pressure = sells_1h > buys_1h * 2 and sells_1h > 10
-        return sell_pressure, buys_5m, sells_5m
+        return sell_pressure, buys_5m, sells_5m, float(volume_24h), float(liquidity)
     except Exception:
-        return False, 0, 0
+        return False, 0, 0, 0, 0
 
 def analyze_rug_risk(mint):
     """
@@ -162,18 +163,27 @@ def analyze_rug_risk(mint):
         risk_score += 15
         flags.append("FREEZE_AUTHORITY_ACTIVE")  # Pueden congelar wallets
 
-    # ── 3. PRESIÓN VENDEDORA ─────────────────────────
-    sell_pressure, buys_5m, sells_5m = get_recent_large_sells(mint)
-    
+    # ── 3. PRESIÓN VENDEDORA + LIQUIDEZ ──────────────
+    sell_pressure, buys_5m, sells_5m, volume_24h, liquidity = get_recent_large_sells(mint)
+
     if sell_pressure:
         risk_score += 25
         flags.append("HEAVY_SELL_PRESSURE")
-    
+
     if sells_5m > buys_5m * 3 and sells_5m > 5:
         risk_score += 15
         flags.append(f"SELLS_DOMINATING_{sells_5m}vs{buys_5m}")
 
-    # ── 4. POCOS HOLDERS ─────────────────────────────
+    # ── 4b. VOLUMEN/LIQUIDEZ DESPROPORCIONADOS ────────
+    # Vol >> liquidez indica manipulación o liquidez casi vacía
+    if liquidity > 0 and volume_24h > liquidity * 50:
+        risk_score += 20
+        flags.append(f"VOL_LIQ_MISMATCH_{int(volume_24h/max(liquidity,1))}x")
+    elif liquidity < 500 and volume_24h > 5000:
+        risk_score += 15
+        flags.append("NEAR_ZERO_LIQUIDITY")
+
+    # ── 5. POCOS HOLDERS ─────────────────────────────
     if holder_count < 5:
         risk_score += 20
         flags.append(f"ONLY_{holder_count}_HOLDERS")
@@ -228,18 +238,33 @@ def save_rug_analysis(mint, analysis):
         pool.putconn(conn)
 
 def get_unanalyzed_tokens():
-    """Tokens recientes sin análisis de rug"""
+    """
+    Tokens pendientes de análisis rug:
+    1. Tokens nuevos sin chequeo (rug_checked_at IS NULL)
+    2. Tokens con señal ENTER cuyo chequeo tiene más de 30min de antigüedad
+       (para detectar cambios post-entrada: dump, liquidez, sell pressure)
+    """
     conn = pool.getconn()
     try:
         cur = conn.cursor()
         cur.execute("""
             SELECT mint, name, symbol, market_cap, buys_5m, signal
             FROM discovered_tokens
-            WHERE rug_checked_at IS NULL
-            AND created_at > NOW() - INTERVAL '24 hours'
-            AND signal IN ('STRONG_BUY', 'BUY')
+            WHERE (
+                -- Nuevos sin chequear
+                (rug_checked_at IS NULL
+                 AND created_at > NOW() - INTERVAL '24 hours'
+                 AND signal IN ('STRONG_BUY', 'BUY'))
+                OR
+                -- ENTER signals con chequeo desactualizado (>30min)
+                (entry_signal = 'ENTER'
+                 AND rug_checked_at < NOW() - INTERVAL '30 minutes'
+                 AND created_at > NOW() - INTERVAL '3 hours')
+            )
             AND price_usd IS NOT NULL
-            ORDER BY survival_score DESC NULLS LAST
+            ORDER BY
+                CASE WHEN entry_signal = 'ENTER' THEN 0 ELSE 1 END,
+                survival_score DESC NULLS LAST
             LIMIT 100
         """)
         rows = cur.fetchall()

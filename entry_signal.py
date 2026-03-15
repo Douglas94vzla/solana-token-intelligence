@@ -166,8 +166,21 @@ def get_token_features(mint):
                    (website  IS NOT NULL)              as has_website,
                    EXTRACT(HOUR FROM created_at)       as launch_hour,
                    COALESCE(liquidity_usd, 0)          as liquidity_usd,
-                   COALESCE(fdv, 0)                    as fdv
-            FROM discovered_tokens WHERE mint = %s
+                   COALESCE(fdv, 0)                    as fdv,
+                   -- Smart money
+                   CASE WHEN EXISTS (
+                       SELECT 1 FROM wallet_activity wa
+                       JOIN smart_wallets sw ON sw.wallet = wa.wallet
+                       WHERE wa.mint = dt.mint AND sw.is_smart = TRUE
+                   ) THEN 1 ELSE 0 END                as smart_money_bought,
+                   -- Narrative momentum
+                   COALESCE((
+                       SELECT ns.momentum FROM narrative_stats ns
+                       WHERE ns.narrative = dt.narrative
+                         AND ns.window_hours = 24
+                       ORDER BY ns.calculated_at DESC LIMIT 1
+                   ), 0)                              as narrative_momentum
+            FROM discovered_tokens dt WHERE dt.mint = %s
         """, (mint,))
         row = cur.fetchone()
         cur.close()
@@ -194,7 +207,8 @@ def ml_predict(mint):
             'buys_1h', 'sells_1h', 'buys_24h', 'sells_24h',
             'rug_score', 'holder_count', 'top10_concentration',
             'dev_sold', 'has_twitter', 'has_telegram', 'has_website',
-            'launch_hour', 'liquidity_usd', 'fdv'
+            'launch_hour', 'liquidity_usd', 'fdv',
+            'smart_money_bought', 'narrative_momentum'
         ])
         numeric_cols = [c for c in df.columns if c != 'narrative']
         df[numeric_cols] = df[numeric_cols].apply(pd.to_numeric, errors='coerce')
@@ -225,6 +239,17 @@ def ml_predict(mint):
         df['log_fdv']            = np.log1p(df['fdv'])
         df['fdv_to_mcap']        = df['fdv'] / (df['market_cap'] + 1)
 
+        # Velocidad de actividad
+        df['buys_growth']      = df['buys_5m']  / (df['buys_24h']  / 288.0 + 1)
+        df['sells_growth']     = df['sells_5m'] / (df['sells_24h'] / 288.0 + 1)
+        df['buy_acceleration'] = df['buys_1h']  / (df['buys_24h']  / 24.0  + 1)
+        df['vol_growth_1h']    = df['volume_1h'] / (df['volume_24h'] / 24.0  + 1)
+        df['vol_growth_5m']    = df['volume_5m'] / (df['volume_24h'] / 288.0 + 1)
+
+        # Smart money y narrativa
+        df['smart_money_bought'] = pd.to_numeric(df['smart_money_bought'], errors='coerce').fillna(0).astype(int)
+        df['narrative_momentum'] = pd.to_numeric(df['narrative_momentum'], errors='coerce').fillna(0)
+
         try:
             df['narrative_encoded'] = label_encoder.transform(df['narrative'].fillna('OTHER'))
         except Exception:
@@ -246,6 +271,11 @@ def ml_predict(mint):
             'has_liquidity',
             'liquidity_usd', 'log_liquidity', 'liquidity_to_mcap',
             'fdv', 'log_fdv', 'fdv_to_mcap',
+            # Velocidad
+            'buys_growth', 'sells_growth', 'buy_acceleration',
+            'vol_growth_1h', 'vol_growth_5m',
+            # Señales externas
+            'smart_money_bought', 'narrative_momentum',
         ]
 
         X = df[features].fillna(0).values

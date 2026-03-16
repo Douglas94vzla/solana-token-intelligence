@@ -36,12 +36,28 @@ def fetch_with_helius(mint):
             symbol = symbol or token_info.get("symbol")
             name = name or result.get("name")
             symbol = symbol or result.get("symbol")
+
+            # ── Extraer deployer wallet ────────────────────────
+            deployer = None
+            for creator in result.get("creators", []):
+                addr = creator.get("address", "")
+                if addr and len(addr) > 30 and not addr.startswith("11111111"):
+                    deployer = addr
+                    break
+            if not deployer:
+                for auth in result.get("authorities", []):
+                    if "full" in auth.get("scopes", []):
+                        addr = auth.get("address", "")
+                        if addr and len(addr) > 30 and not addr.startswith("11111111"):
+                            deployer = addr
+                            break
+
             if name:
-                return name, symbol
-        return None, None
+                return name, symbol, deployer
+        return None, None, None
     except Exception as e:
         print(f"Error RPC: {e}")
-        return None, None
+        return None, None, None
 
 if __name__ == "__main__":
     print("Iniciando Enriquecedor...")
@@ -62,12 +78,16 @@ if __name__ == "__main__":
 
     success_count = 0
     for mint, t_created in tokens:
-        name, symbol = fetch_with_helius(mint)
+        name, symbol, deployer = fetch_with_helius(mint)
         if name:
-            print(f"OK: {name} ({symbol})")
+            print(f"OK: {name} ({symbol})" + (f" | deployer: {deployer[:12]}..." if deployer else ""))
             cur.execute(
-                "UPDATE discovered_tokens SET name=%s, symbol=%s, fetch_attempts=COALESCE(fetch_attempts,0)+1 WHERE mint=%s",
-                (name, symbol, mint)
+                """UPDATE discovered_tokens
+                   SET name=%s, symbol=%s,
+                       deployer_wallet=COALESCE(deployer_wallet, %s),
+                       fetch_attempts=COALESCE(fetch_attempts,0)+1
+                   WHERE mint=%s""",
+                (name, symbol, deployer, mint)
             )
             success_count += 1
         else:

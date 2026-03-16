@@ -223,7 +223,7 @@ async def fetch_initial_price(mint):
         return None
 
 
-async def save_token(mint):
+async def save_token(mint, tx_signature=None):
     if mint in seen_mints:
         return
     seen_mints.add(mint)
@@ -232,9 +232,9 @@ async def save_token(mint):
     try:
         cur = conn.cursor()
         cur.execute(
-            "INSERT INTO discovered_tokens (mint, status) VALUES (%s, %s) "
+            "INSERT INTO discovered_tokens (mint, status, tx_signature) VALUES (%s, %s, %s) "
             "ON CONFLICT (mint) DO NOTHING RETURNING id",
-            (mint, 'new')
+            (mint, 'new', tx_signature)
         )
         result = cur.fetchone()
         conn.commit()
@@ -327,7 +327,9 @@ async def connect_and_listen(idx: int) -> str:
                 data = json.loads(msg)
 
                 if "params" in data:
-                    logs = data["params"]["result"]["value"]["logs"]
+                    value = data["params"]["result"]["value"]
+                    logs  = value.get("logs", [])
+                    tx_sig = value.get("signature")   # signature de la tx de creación
                     if any("Instruction: Create" in l for l in logs):
                         for log_line in logs:
                             if "Program data:" in log_line:
@@ -336,12 +338,12 @@ async def connect_and_listen(idx: int) -> str:
                                     mint_bytes = raw_data[8:40]
                                     mint = base58.b58encode(mint_bytes).decode('utf-8')
                                     if mint.endswith("pump"):
-                                        await save_token(mint)
+                                        await save_token(mint, tx_signature=tx_sig)
                                 except Exception:
                                     continue
                             elif "mint:" in log_line.lower():
                                 mint = log_line.split("mint:")[1].split(",")[0].strip()
-                                await save_token(mint)
+                                await save_token(mint, tx_signature=tx_sig)
 
     except websockets.exceptions.InvalidStatus as e:       # websockets >= 14
         return f"HTTP {e.response.status_code}"

@@ -52,6 +52,26 @@ def setup_db():
     finally:
         pool.putconn(conn)
 
+def get_deployer_history(mint):
+    """
+    Consulta el historial del deployer de este token.
+    Retorna (is_serial_rugger, total_tokens, rugged_count, rug_rate) o None.
+    """
+    conn = pool.getconn()
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT ds.is_serial_rugger, ds.total_tokens, ds.rugged_count, ds.rug_rate
+            FROM discovered_tokens dt
+            JOIN deployer_stats ds ON ds.wallet = dt.deployer_wallet
+            WHERE dt.mint = %s
+        """, (mint,))
+        return cur.fetchone()
+    except Exception:
+        return None
+    finally:
+        pool.putconn(conn)
+
 def get_token_largest_accounts(mint):
     """Obtiene los top holders del token"""
     payload = {
@@ -190,6 +210,17 @@ def analyze_rug_risk(mint):
     elif holder_count < 10:
         risk_score += 10
         flags.append(f"FEW_HOLDERS_{holder_count}")
+
+    # ── 6. HISTORIAL DEL DEPLOYER ────────────────────
+    deployer_info = get_deployer_history(mint)
+    if deployer_info:
+        is_serial, total, rugged, rate = deployer_info
+        if is_serial:
+            risk_score += 35
+            flags.append(f"KNOWN_RUGGER_{rugged}of{total}tokens")
+        elif rate >= 0.30 and total >= 2:
+            risk_score += 15
+            flags.append(f"SUSPICIOUS_DEPLOYER_{rugged}of{total}tokens")
 
     # ── CLASIFICACIÓN FINAL ──────────────────────────
     risk_score = min(risk_score, 100)

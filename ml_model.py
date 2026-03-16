@@ -86,6 +86,12 @@ def load_training_data():
                       AND ns.window_hours = 24
                     ORDER BY ns.calculated_at DESC LIMIT 1
                 ), 0)                                   as narrative_momentum,
+                -- Historial del deployer (mejora 15: deployer tracking)
+                COALESCE(ds.total_tokens, 0)            as deployer_prior_tokens,
+                COALESCE(ds.rugged_count, 0)            as deployer_rugged_count,
+                COALESCE(ds.rug_rate, 0.5)              as deployer_rug_rate,
+                COALESCE(ds.is_serial_rugger::int, 0)   as is_known_rugger,
+                (dt.deployer_wallet IS NOT NULL)::int   as deployer_known,
                 MIN(ps.price_usd)                       as price_entry,
                 MAX(ps.price_usd)                       as price_max,
                 COUNT(ps.id)                            as snapshot_count,
@@ -95,6 +101,7 @@ def load_training_data():
                 END as target
             FROM discovered_tokens dt
             JOIN price_snapshots ps ON ps.mint = dt.mint
+            LEFT JOIN deployer_stats ds ON ds.wallet = dt.deployer_wallet
             WHERE dt.buys_5m       IS NOT NULL
               AND dt.survival_score IS NOT NULL
               AND dt.market_cap     IS NOT NULL
@@ -106,7 +113,9 @@ def load_training_data():
                 dt.buys_1h, dt.sells_1h, dt.buys_24h, dt.sells_24h,
                 dt.rug_score, dt.holder_count, dt.top10_concentration,
                 dt.dev_sold, dt.twitter, dt.telegram, dt.website,
-                dt.created_at, dt.liquidity_usd, dt.fdv
+                dt.created_at, dt.liquidity_usd, dt.fdv,
+                dt.deployer_wallet, ds.total_tokens, ds.rugged_count,
+                ds.rug_rate, ds.is_serial_rugger
             HAVING COUNT(ps.id) >= %s
         """, (TARGET_GAIN, MIN_SNAPSHOTS))
 
@@ -121,6 +130,8 @@ def load_training_data():
             'dev_sold', 'has_twitter', 'has_telegram', 'has_website',
             'launch_hour', 'liquidity_usd', 'fdv',
             'smart_money_bought', 'narrative_momentum',
+            'deployer_prior_tokens', 'deployer_rugged_count',
+            'deployer_rug_rate', 'is_known_rugger', 'deployer_known',
             'price_entry', 'price_max', 'snapshot_count', 'target'
         ]
 
@@ -197,6 +208,14 @@ def engineer_features(df):
     df['smart_money_bought']  = df['smart_money_bought'].fillna(0).astype(int)
     df['narrative_momentum']  = pd.to_numeric(df['narrative_momentum'], errors='coerce').fillna(0)
 
+    # ── Deployer features (mejora 15) ──────────────────
+    # deployer_rug_rate: 0.5 = desconocido (neutro), 0 = limpio, 1 = rugger total
+    df['deployer_prior_tokens'] = np.log1p(df['deployer_prior_tokens'].fillna(0))
+    df['deployer_rugged_count'] = df['deployer_rugged_count'].fillna(0).astype(int)
+    df['deployer_rug_rate']     = pd.to_numeric(df['deployer_rug_rate'], errors='coerce').fillna(0.5).clip(0, 1)
+    df['is_known_rugger']       = df['is_known_rugger'].fillna(0).astype(int)
+    df['deployer_known']        = df['deployer_known'].fillna(0).astype(int)
+
     return df, le
 
 def get_feature_columns():
@@ -226,6 +245,9 @@ def get_feature_columns():
         'vol_growth_1h', 'vol_growth_5m',
         # Señales externas
         'smart_money_bought', 'narrative_momentum',
+        # Historial del deployer
+        'deployer_prior_tokens', 'deployer_rugged_count',
+        'deployer_rug_rate', 'is_known_rugger', 'deployer_known',
     ]
 
 def train_models(X, y):

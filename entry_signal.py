@@ -202,8 +202,16 @@ def get_token_features(mint):
                        WHERE ns.narrative = dt.narrative
                          AND ns.window_hours = 24
                        ORDER BY ns.calculated_at DESC LIMIT 1
-                   ), 0)                              as narrative_momentum
-            FROM discovered_tokens dt WHERE dt.mint = %s
+                   ), 0)                              as narrative_momentum,
+                   -- Historial del deployer
+                   COALESCE(ds.total_tokens, 0)       as deployer_prior_tokens,
+                   COALESCE(ds.rugged_count, 0)       as deployer_rugged_count,
+                   COALESCE(ds.rug_rate, 0.5)         as deployer_rug_rate,
+                   COALESCE(ds.is_serial_rugger::int, 0) as is_known_rugger,
+                   (dt.deployer_wallet IS NOT NULL)::int as deployer_known
+            FROM discovered_tokens dt
+            LEFT JOIN deployer_stats ds ON ds.wallet = dt.deployer_wallet
+            WHERE dt.mint = %s
         """, (mint,))
         row = cur.fetchone()
         cur.close()
@@ -231,7 +239,9 @@ def ml_predict(mint):
             'rug_score', 'holder_count', 'top10_concentration',
             'dev_sold', 'has_twitter', 'has_telegram', 'has_website',
             'launch_hour', 'liquidity_usd', 'fdv',
-            'smart_money_bought', 'narrative_momentum'
+            'smart_money_bought', 'narrative_momentum',
+            'deployer_prior_tokens', 'deployer_rugged_count',
+            'deployer_rug_rate', 'is_known_rugger', 'deployer_known',
         ])
         numeric_cols = [c for c in df.columns if c != 'narrative']
         df[numeric_cols] = df[numeric_cols].apply(pd.to_numeric, errors='coerce')
@@ -273,6 +283,13 @@ def ml_predict(mint):
         df['smart_money_bought'] = pd.to_numeric(df['smart_money_bought'], errors='coerce').fillna(0).astype(int)
         df['narrative_momentum'] = pd.to_numeric(df['narrative_momentum'], errors='coerce').fillna(0)
 
+        # Deployer features
+        df['deployer_prior_tokens'] = np.log1p(pd.to_numeric(df['deployer_prior_tokens'], errors='coerce').fillna(0))
+        df['deployer_rugged_count'] = pd.to_numeric(df['deployer_rugged_count'], errors='coerce').fillna(0).astype(int)
+        df['deployer_rug_rate']     = pd.to_numeric(df['deployer_rug_rate'], errors='coerce').fillna(0.5).clip(0, 1)
+        df['is_known_rugger']       = pd.to_numeric(df['is_known_rugger'], errors='coerce').fillna(0).astype(int)
+        df['deployer_known']        = pd.to_numeric(df['deployer_known'], errors='coerce').fillna(0).astype(int)
+
         try:
             df['narrative_encoded'] = label_encoder.transform(df['narrative'].fillna('OTHER'))
         except Exception:
@@ -299,6 +316,9 @@ def ml_predict(mint):
             'vol_growth_1h', 'vol_growth_5m',
             # Señales externas
             'smart_money_bought', 'narrative_momentum',
+            # Historial del deployer
+            'deployer_prior_tokens', 'deployer_rugged_count',
+            'deployer_rug_rate', 'is_known_rugger', 'deployer_known',
         ]
 
         X = df[features].fillna(0).values

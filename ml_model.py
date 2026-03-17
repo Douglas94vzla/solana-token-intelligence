@@ -42,88 +42,146 @@ FEATURES_PATH  = '/root/solana_bot/features.pkl'
 
 def load_training_data():
     """
-    Carga TODO el histórico disponible (sin límite de días).
-    Target binario: 1 = token subió TARGET_GAIN%+ desde precio mínimo inicial.
+    Carga datos de entrenamiento SIN leakage temporal ni de target.
+
+    Fuente: token_features_at_signal — foto de las features en el instante exacto
+    del primer BUY/STRONG_BUY, antes de que el precio se mueva.
+
+    Target correcto: ¿subió TARGET_GAIN%+ en las 2 horas siguientes al signal,
+    partiendo del precio registrado en ese momento (no del mínimo histórico)?
+
+    Fallback al método antiguo solo si la tabla nueva tiene < 50 registros válidos.
     """
     conn = pool.getconn()
     try:
         cur = conn.cursor()
+
+        # ── Contar datos limpios disponibles ───────────────────────────────
         cur.execute("""
-            SELECT
-                dt.mint,
-                dt.buys_5m,
-                dt.sells_5m,
-                dt.market_cap,
-                dt.volume_24h,
-                COALESCE(dt.volume_1h, 0)  as volume_1h,
-                COALESCE(dt.volume_5m, 0)  as volume_5m,
-                dt.survival_score,
-                dt.narrative,
-                dt.buys_1h,
-                dt.sells_1h,
-                COALESCE(dt.buys_24h, 0)  as buys_24h,
-                COALESCE(dt.sells_24h, 0) as sells_24h,
-                COALESCE(dt.rug_score, 50)              as rug_score,
-                COALESCE(dt.holder_count, 10)           as holder_count,
-                COALESCE(dt.top10_concentration, 95)    as top10_concentration,
-                COALESCE(dt.dev_sold, FALSE)            as dev_sold,
-                (dt.twitter  IS NOT NULL)               as has_twitter,
-                (dt.telegram IS NOT NULL)               as has_telegram,
-                (dt.website  IS NOT NULL)               as has_website,
-                EXTRACT(HOUR FROM dt.created_at)        as launch_hour,
-                COALESCE(dt.liquidity_usd, 0)           as liquidity_usd,
-                COALESCE(dt.fdv, 0)                     as fdv,
-                -- Smart money: alguna wallet conocida compró este token
-                CASE WHEN EXISTS (
-                    SELECT 1 FROM wallet_activity wa
-                    JOIN smart_wallets sw ON sw.wallet = wa.wallet
-                    WHERE wa.mint = dt.mint AND sw.is_smart = TRUE
-                ) THEN 1 ELSE 0 END                     as smart_money_bought,
-                -- Narrative momentum: crecimiento de volumen de la narrativa
-                COALESCE((
-                    SELECT ns.momentum FROM narrative_stats ns
-                    WHERE ns.narrative = dt.narrative
-                      AND ns.window_hours = 24
-                    ORDER BY ns.calculated_at DESC LIMIT 1
-                ), 0)                                   as narrative_momentum,
-                -- Historial del deployer (mejora 15: deployer tracking)
-                COALESCE(ds.total_tokens, 0)            as deployer_prior_tokens,
-                COALESCE(ds.rugged_count, 0)            as deployer_rugged_count,
-                COALESCE(ds.rug_rate, 0.5)              as deployer_rug_rate,
-                COALESCE(ds.is_serial_rugger::int, 0)   as is_known_rugger,
-                (dt.deployer_wallet IS NOT NULL)::int   as deployer_known,
-                MIN(ps.price_usd)                       as price_entry,
-                MAX(ps.price_usd)                       as price_max,
-                COUNT(ps.id)                            as snapshot_count,
-                CASE
-                    WHEN MAX(ps.price_usd) >= MIN(ps.price_usd) * (1 + %s)
-                    THEN 1 ELSE 0
-                END as target
-            FROM discovered_tokens dt
-            JOIN price_snapshots ps ON ps.mint = dt.mint
-            LEFT JOIN deployer_stats ds ON ds.wallet = dt.deployer_wallet
-            WHERE dt.buys_5m       IS NOT NULL
-              AND dt.survival_score IS NOT NULL
-              AND dt.market_cap     IS NOT NULL
-              AND dt.market_cap     > 0
-            GROUP BY
-                dt.mint, dt.buys_5m, dt.sells_5m, dt.market_cap,
-                dt.volume_24h, dt.volume_1h, dt.volume_5m,
-                dt.survival_score, dt.narrative,
-                dt.buys_1h, dt.sells_1h, dt.buys_24h, dt.sells_24h,
-                dt.rug_score, dt.holder_count, dt.top10_concentration,
-                dt.dev_sold, dt.twitter, dt.telegram, dt.website,
-                dt.created_at, dt.liquidity_usd, dt.fdv,
-                dt.deployer_wallet, ds.total_tokens, ds.rugged_count,
-                ds.rug_rate, ds.is_serial_rugger
-            HAVING COUNT(ps.id) >= %s
-        """, (TARGET_GAIN, MIN_SNAPSHOTS))
+            SELECT COUNT(*) FROM token_features_at_signal tfs
+            WHERE tfs.price_at_signal > 0
+              AND EXISTS (
+                SELECT 1 FROM price_snapshots ps
+                WHERE ps.mint = tfs.mint
+                  AND ps.snapshot_at > tfs.captured_at
+                  AND ps.snapshot_at <= tfs.captured_at + INTERVAL '120 minutes'
+              )
+        """)
+        clean_count = cur.fetchone()[0]
+        log.info(f"token_features_at_signal: {clean_count} registros con label válido")
+
+        if clean_count >= 50:
+            # ── MÉTODO LIMPIO: features al momento del signal, target futuro ──
+            log.info("✅ Usando datos sin leakage (token_features_at_signal)")
+            cur.execute("""
+                WITH future_max AS (
+                    SELECT tfs.mint,
+                           MAX(ps.price_usd)  AS max_future_price,
+                           COUNT(ps.id)       AS future_snaps
+                    FROM token_features_at_signal tfs
+                    JOIN price_snapshots ps ON ps.mint = tfs.mint
+                      AND ps.snapshot_at >  tfs.captured_at
+                      AND ps.snapshot_at <= tfs.captured_at + INTERVAL '120 minutes'
+                    GROUP BY tfs.mint
+                    HAVING COUNT(ps.id) >= 3
+                )
+                SELECT
+                    tfs.buys_5m,
+                    tfs.sells_5m,
+                    tfs.market_cap,
+                    tfs.volume_24h,
+                    COALESCE(tfs.volume_1h, 0),
+                    COALESCE(tfs.volume_5m, 0),
+                    tfs.survival_score,
+                    tfs.narrative,
+                    tfs.buys_1h,
+                    tfs.sells_1h,
+                    COALESCE(tfs.buys_24h, 0),
+                    COALESCE(tfs.sells_24h, 0),
+                    COALESCE(tfs.rug_score, 50),
+                    COALESCE(tfs.holder_count, 10),
+                    COALESCE(tfs.top10_concentration, 95),
+                    COALESCE(tfs.dev_sold, FALSE),
+                    tfs.has_twitter,
+                    tfs.has_telegram,
+                    tfs.has_website,
+                    EXTRACT(HOUR FROM tfs.captured_at)  AS launch_hour,
+                    COALESCE(tfs.liquidity_usd, 0),
+                    COALESCE(tfs.fdv, 0),
+                    COALESCE(tfs.smart_money_bought, 0),
+                    COALESCE(tfs.narrative_momentum, 0),
+                    COALESCE(tfs.deployer_prior_tokens, 0),
+                    COALESCE(tfs.deployer_rugged_count, 0),
+                    COALESCE(tfs.deployer_rug_rate, 0.5),
+                    COALESCE(tfs.is_known_rugger, 0),
+                    COALESCE(tfs.deployer_known, 0),
+                    CASE WHEN fm.max_future_price >= tfs.price_at_signal * (1 + %s)
+                         THEN 1 ELSE 0 END  AS target
+                FROM token_features_at_signal tfs
+                JOIN future_max fm ON fm.mint = tfs.mint
+                WHERE tfs.price_at_signal > 0
+                  AND tfs.buys_5m IS NOT NULL
+                  AND tfs.market_cap IS NOT NULL
+                  AND tfs.market_cap > 0
+            """, (TARGET_GAIN,))
+            source = "LIMPIO"
+
+        else:
+            # ── FALLBACK: método antiguo mientras se acumulan datos limpios ──
+            log.warning(f"⚠️  Solo {clean_count} registros limpios — usando método legacy (con leakage)")
+            cur.execute("""
+                SELECT
+                    dt.buys_5m, dt.sells_5m, dt.market_cap, dt.volume_24h,
+                    COALESCE(dt.volume_1h, 0), COALESCE(dt.volume_5m, 0),
+                    dt.survival_score, dt.narrative, dt.buys_1h, dt.sells_1h,
+                    COALESCE(dt.buys_24h, 0), COALESCE(dt.sells_24h, 0),
+                    COALESCE(dt.rug_score, 50), COALESCE(dt.holder_count, 10),
+                    COALESCE(dt.top10_concentration, 95),
+                    COALESCE(dt.dev_sold, FALSE),
+                    (dt.twitter IS NOT NULL), (dt.telegram IS NOT NULL), (dt.website IS NOT NULL),
+                    EXTRACT(HOUR FROM dt.created_at),
+                    COALESCE(dt.liquidity_usd, 0), COALESCE(dt.fdv, 0),
+                    CASE WHEN EXISTS (
+                        SELECT 1 FROM wallet_activity wa
+                        JOIN smart_wallets sw ON sw.wallet = wa.wallet
+                        WHERE wa.mint = dt.mint AND sw.is_smart = TRUE
+                    ) THEN 1 ELSE 0 END,
+                    COALESCE((
+                        SELECT ns.momentum FROM narrative_stats ns
+                        WHERE ns.narrative = dt.narrative AND ns.window_hours = 24
+                        ORDER BY ns.calculated_at DESC LIMIT 1
+                    ), 0),
+                    COALESCE(ds.total_tokens, 0), COALESCE(ds.rugged_count, 0),
+                    COALESCE(ds.rug_rate, 0.5), COALESCE(ds.is_serial_rugger::int, 0),
+                    (dt.deployer_wallet IS NOT NULL)::int,
+                    CASE WHEN MAX(ps.price_usd) >= MIN(ps.price_usd) * (1 + %s)
+                         THEN 1 ELSE 0 END AS target
+                FROM discovered_tokens dt
+                JOIN price_snapshots ps ON ps.mint = dt.mint
+                LEFT JOIN deployer_stats ds ON ds.wallet = dt.deployer_wallet
+                WHERE dt.buys_5m IS NOT NULL
+                  AND dt.survival_score IS NOT NULL
+                  AND dt.market_cap IS NOT NULL
+                  AND dt.market_cap > 0
+                GROUP BY
+                    dt.mint, dt.buys_5m, dt.sells_5m, dt.market_cap,
+                    dt.volume_24h, dt.volume_1h, dt.volume_5m,
+                    dt.survival_score, dt.narrative,
+                    dt.buys_1h, dt.sells_1h, dt.buys_24h, dt.sells_24h,
+                    dt.rug_score, dt.holder_count, dt.top10_concentration,
+                    dt.dev_sold, dt.twitter, dt.telegram, dt.website,
+                    dt.created_at, dt.liquidity_usd, dt.fdv,
+                    dt.deployer_wallet, ds.total_tokens, ds.rugged_count,
+                    ds.rug_rate, ds.is_serial_rugger
+                HAVING COUNT(ps.id) >= %s
+            """, (TARGET_GAIN, MIN_SNAPSHOTS))
+            source = "LEGACY"
 
         rows = cur.fetchall()
         cur.close()
 
         columns = [
-            'mint', 'buys_5m', 'sells_5m', 'market_cap', 'volume_24h',
+            'buys_5m', 'sells_5m', 'market_cap', 'volume_24h',
             'volume_1h', 'volume_5m', 'survival_score', 'narrative',
             'buys_1h', 'sells_1h', 'buys_24h', 'sells_24h',
             'rug_score', 'holder_count', 'top10_concentration',
@@ -132,11 +190,11 @@ def load_training_data():
             'smart_money_bought', 'narrative_momentum',
             'deployer_prior_tokens', 'deployer_rugged_count',
             'deployer_rug_rate', 'is_known_rugger', 'deployer_known',
-            'price_entry', 'price_max', 'snapshot_count', 'target'
+            'target'
         ]
 
         df = pd.DataFrame(rows, columns=columns)
-        log.info(f"✅ {len(df)} tokens cargados para entrenamiento (histórico completo)")
+        log.info(f"✅ [{source}] {len(df)} tokens cargados")
         log.info(f"   Ganadores (target=1): {df['target'].sum()} ({df['target'].mean()*100:.1f}%)")
         log.info(f"   Perdedores (target=0): {(1-df['target']).sum()} ({(1-df['target']).mean()*100:.1f}%)")
         return df

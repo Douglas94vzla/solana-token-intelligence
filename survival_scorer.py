@@ -41,10 +41,101 @@ def setup_db():
         except Exception as e:
             conn.rollback()
             log.warning(f"ALTER TABLE skipped (lock timeout): {e}")
+
+        # Tabla de features en el momento exacto del primer signal — sin leakage temporal
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS token_features_at_signal (
+                id                   SERIAL PRIMARY KEY,
+                mint                 TEXT NOT NULL UNIQUE,
+                signal               TEXT NOT NULL,
+                captured_at          TIMESTAMP DEFAULT NOW(),
+                price_at_signal      NUMERIC,
+                buys_5m              INT,
+                sells_5m             INT,
+                market_cap           NUMERIC,
+                volume_24h           NUMERIC,
+                volume_1h            NUMERIC DEFAULT 0,
+                volume_5m            NUMERIC DEFAULT 0,
+                survival_score       INT,
+                narrative            TEXT,
+                buys_1h              INT,
+                sells_1h             INT,
+                buys_24h             INT DEFAULT 0,
+                sells_24h            INT DEFAULT 0,
+                rug_score            INT DEFAULT 50,
+                holder_count         INT DEFAULT 10,
+                top10_concentration  NUMERIC DEFAULT 95,
+                dev_sold             BOOLEAN DEFAULT FALSE,
+                has_twitter          BOOLEAN DEFAULT FALSE,
+                has_telegram         BOOLEAN DEFAULT FALSE,
+                has_website          BOOLEAN DEFAULT FALSE,
+                launch_hour          INT,
+                liquidity_usd        NUMERIC DEFAULT 0,
+                fdv                  NUMERIC DEFAULT 0,
+                smart_money_bought   INT DEFAULT 0,
+                narrative_momentum   NUMERIC DEFAULT 0,
+                deployer_prior_tokens INT DEFAULT 0,
+                deployer_rugged_count INT DEFAULT 0,
+                deployer_rug_rate    NUMERIC DEFAULT 0.5,
+                is_known_rugger      INT DEFAULT 0,
+                deployer_known       INT DEFAULT 0
+            )
+        """)
+        conn.commit()
         cur.close()
-        log.info("✅ Columnas de scoring añadidas")
+        log.info("✅ Columnas de scoring y tabla token_features_at_signal listas")
     finally:
         pool.putconn(conn)
+
+
+def capture_features_at_signal(cur, mint, signal):
+    """
+    Guarda una foto de todas las features del token en el momento del primer signal BUY/STRONG_BUY.
+    ON CONFLICT DO NOTHING → solo captura la primera vez.
+    """
+    try:
+        cur.execute("""
+            INSERT INTO token_features_at_signal (
+                mint, signal, captured_at, price_at_signal,
+                buys_5m, sells_5m, market_cap, volume_24h, volume_1h, volume_5m,
+                survival_score, narrative, buys_1h, sells_1h, buys_24h, sells_24h,
+                rug_score, holder_count, top10_concentration, dev_sold,
+                has_twitter, has_telegram, has_website, launch_hour,
+                liquidity_usd, fdv, smart_money_bought, narrative_momentum,
+                deployer_prior_tokens, deployer_rugged_count, deployer_rug_rate,
+                is_known_rugger, deployer_known
+            )
+            SELECT
+                dt.mint, %s, NOW(), dt.price_usd,
+                dt.buys_5m, dt.sells_5m, dt.market_cap, dt.volume_24h,
+                COALESCE(dt.volume_1h, 0), COALESCE(dt.volume_5m, 0),
+                dt.survival_score, dt.narrative, dt.buys_1h, dt.sells_1h,
+                COALESCE(dt.buys_24h, 0), COALESCE(dt.sells_24h, 0),
+                COALESCE(dt.rug_score, 50), COALESCE(dt.holder_count, 10),
+                COALESCE(dt.top10_concentration, 95), COALESCE(dt.dev_sold, FALSE),
+                (dt.twitter  IS NOT NULL), (dt.telegram IS NOT NULL), (dt.website IS NOT NULL),
+                EXTRACT(HOUR FROM dt.created_at),
+                COALESCE(dt.liquidity_usd, 0), COALESCE(dt.fdv, 0),
+                CASE WHEN EXISTS (
+                    SELECT 1 FROM wallet_activity wa
+                    JOIN smart_wallets sw ON sw.wallet = wa.wallet
+                    WHERE wa.mint = dt.mint AND sw.is_smart = TRUE
+                ) THEN 1 ELSE 0 END,
+                COALESCE((
+                    SELECT ns.momentum FROM narrative_stats ns
+                    WHERE ns.narrative = dt.narrative AND ns.window_hours = 24
+                    ORDER BY ns.calculated_at DESC LIMIT 1
+                ), 0),
+                COALESCE(ds.total_tokens, 0), COALESCE(ds.rugged_count, 0),
+                COALESCE(ds.rug_rate, 0.5), COALESCE(ds.is_serial_rugger::int, 0),
+                (dt.deployer_wallet IS NOT NULL)::int
+            FROM discovered_tokens dt
+            LEFT JOIN deployer_stats ds ON ds.wallet = dt.deployer_wallet
+            WHERE dt.mint = %s
+            ON CONFLICT (mint) DO NOTHING
+        """, (signal, mint))
+    except Exception as e:
+        log.warning(f"capture_features_at_signal falló para {mint[:8]}: {e}")
 
 def compute_score(token):
     """
@@ -163,9 +254,12 @@ def score_recent_tokens():
                 SET survival_score = %s, signal = %s, scored_at = NOW()
                 WHERE mint = %s
             """, (score, signal, token['mint']))
-            
+
+            if signal in ('STRONG_BUY', 'BUY'):
+                capture_features_at_signal(cur, token['mint'], signal)
+
             results[signal] += 1
-            
+
             if signal in ('STRONG_BUY', 'BUY'):
                 log.info(f"🎯 {signal} | Score: {score} | {token['name']} ({token['symbol']}) | "
                         f"Buys5m: {token['buys_5m']} | MCap: ${token['market_cap']} | "

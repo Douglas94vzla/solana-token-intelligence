@@ -70,21 +70,26 @@ async def fetch_price(session, mint):
                 return mint, None
             # Tomar el par con mayor volumen 24h
             pair = max(pairs, key=lambda p: p.get("volume", {}).get("h24", 0))
+            pc = pair.get("priceChange") or {}
             return mint, {
-                "price_usd":     pair.get("priceUsd"),
-                "market_cap":    pair.get("marketCap"),
-                "volume_24h":    pair.get("volume", {}).get("h24"),
-                "volume_1h":     pair.get("volume", {}).get("h1"),
-                "volume_5m":     pair.get("volume", {}).get("m5"),
-                "buys_24h":      pair.get("txns", {}).get("h24", {}).get("buys"),
-                "sells_24h":     pair.get("txns", {}).get("h24", {}).get("sells"),
-                "buys_1h":       pair.get("txns", {}).get("h1", {}).get("buys"),
-                "sells_1h":      pair.get("txns", {}).get("h1", {}).get("sells"),
-                "buys_5m":       pair.get("txns", {}).get("m5", {}).get("buys"),
-                "sells_5m":      pair.get("txns", {}).get("m5", {}).get("sells"),
-                "pair_address":  pair.get("pairAddress"),
-                "liquidity_usd": pair.get("liquidity", {}).get("usd"),
-                "fdv":           pair.get("fdv"),
+                "price_usd":        pair.get("priceUsd"),
+                "market_cap":       pair.get("marketCap"),
+                "volume_24h":       pair.get("volume", {}).get("h24"),
+                "volume_1h":        pair.get("volume", {}).get("h1"),
+                "volume_5m":        pair.get("volume", {}).get("m5"),
+                "buys_24h":         pair.get("txns", {}).get("h24", {}).get("buys"),
+                "sells_24h":        pair.get("txns", {}).get("h24", {}).get("sells"),
+                "buys_1h":          pair.get("txns", {}).get("h1", {}).get("buys"),
+                "sells_1h":         pair.get("txns", {}).get("h1", {}).get("sells"),
+                "buys_5m":          pair.get("txns", {}).get("m5", {}).get("buys"),
+                "sells_5m":         pair.get("txns", {}).get("m5", {}).get("sells"),
+                "pair_address":     pair.get("pairAddress"),
+                "liquidity_usd":    pair.get("liquidity", {}).get("usd"),
+                "fdv":              pair.get("fdv"),
+                "price_change_15m": pc.get("m5"),   # DexScreener no tiene 15m, usamos 5m
+                "price_change_1h":  pc.get("h1"),
+                "price_change_6h":  pc.get("h6"),
+                "price_change_24h": pc.get("h24"),
             }
     except Exception as e:
         return mint, None
@@ -98,20 +103,24 @@ def save_prices(results):
             if data:
                 cur.execute("""
                     UPDATE discovered_tokens SET
-                        price_usd     = %s,
-                        market_cap    = %s,
-                        volume_24h    = %s,
-                        volume_1h     = %s,
-                        volume_5m     = %s,
-                        buys_24h      = %s,
-                        sells_24h     = %s,
-                        buys_1h       = %s,
-                        sells_1h      = %s,
-                        buys_5m       = %s,
-                        sells_5m      = %s,
-                        pair_address  = %s,
-                        liquidity_usd = %s,
-                        fdv           = %s,
+                        price_usd        = %s,
+                        market_cap       = %s,
+                        volume_24h       = %s,
+                        volume_1h        = %s,
+                        volume_5m        = %s,
+                        buys_24h         = %s,
+                        sells_24h        = %s,
+                        buys_1h          = %s,
+                        sells_1h         = %s,
+                        buys_5m          = %s,
+                        sells_5m         = %s,
+                        pair_address     = %s,
+                        liquidity_usd    = COALESCE(%s, liquidity_usd),
+                        fdv              = COALESCE(%s, fdv),
+                        price_change_15m = COALESCE(%s, price_change_15m),
+                        price_change_1h  = COALESCE(%s, price_change_1h),
+                        price_change_6h  = %s,
+                        price_change_24h = %s,
                         price_updated_at = NOW()
                     WHERE mint = %s
                 """, (
@@ -122,6 +131,8 @@ def save_prices(results):
                     data["buys_5m"], data["sells_5m"],
                     data["pair_address"],
                     data["liquidity_usd"], data["fdv"],
+                    data["price_change_15m"], data["price_change_1h"],
+                    data["price_change_6h"], data["price_change_24h"],
                     mint
                 ))
                 success += 1

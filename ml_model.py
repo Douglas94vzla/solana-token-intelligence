@@ -8,6 +8,7 @@ import pandas as pd
 from datetime import datetime
 from dotenv import load_dotenv
 from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
+from sklearn.calibration import CalibratedClassifierCV
 from sklearn.model_selection import cross_val_score, StratifiedKFold, train_test_split
 from sklearn.preprocessing import LabelEncoder
 from sklearn.metrics import classification_report, confusion_matrix, roc_auc_score
@@ -83,7 +84,7 @@ def load_training_data():
                       AND ps.snapshot_at >  tfs.captured_at
                       AND ps.snapshot_at <= tfs.captured_at + INTERVAL '120 minutes'
                     GROUP BY tfs.mint
-                    HAVING COUNT(ps.id) >= 3
+                    HAVING COUNT(ps.id) >= 2
                 )
                 SELECT
                     tfs.buys_5m,
@@ -320,8 +321,9 @@ def train_models(X, y):
         'RandomForest': (
             RandomForestClassifier(
                 n_estimators=300,
-                max_depth=8,
-                min_samples_leaf=3,
+                max_depth=6,          # reducido de 8 → menos overfitting
+                min_samples_leaf=5,   # aumentado de 3 → más generalización
+                max_features='sqrt',
                 class_weight='balanced',
                 random_state=42,
                 n_jobs=-1
@@ -330,10 +332,11 @@ def train_models(X, y):
         ),
         'GradientBoosting': (
             GradientBoostingClassifier(
-                n_estimators=300,
-                max_depth=4,
+                n_estimators=200,
+                max_depth=3,          # reducido de 4 → menos overfitting
                 learning_rate=0.05,
-                subsample=0.8,
+                subsample=0.7,
+                min_samples_leaf=5,
                 random_state=42
             ),
             {'sample_weight': sample_weights}
@@ -346,6 +349,9 @@ def train_models(X, y):
                 scale_pos_weight=ratio,
                 subsample=0.8,
                 colsample_bytree=0.8,
+                reg_alpha=0.1,        # L1 regularización (nuevo)
+                reg_lambda=1.5,       # L2 regularización (aumentado)
+                min_child_weight=3,   # mínimo muestras por hoja (nuevo)
                 random_state=42,
                 eval_metric='logloss',
                 verbosity=0
@@ -400,7 +406,7 @@ def train_models(X, y):
     else:
         best_model.fit(X, y)
 
-    # Feature importance
+    # Feature importance (antes de calibrar, para que el atributo esté disponible)
     if hasattr(best_model, 'feature_importances_'):
         feature_cols = get_feature_columns()
         importances = pd.Series(
@@ -412,6 +418,16 @@ def train_models(X, y):
         for feat, imp in importances.head(10).items():
             bar = "█" * int(imp * 50)
             print(f"  {feat:<28} {bar} {imp:.3f}")
+
+    # Calibrar probabilidades con isotonic regression (mejora fiabilidad prob)
+    # Usamos cv=5 con los mismos datos — válido porque el CV anterior ya evaluó
+    try:
+        calibrated = CalibratedClassifierCV(best_model, method='isotonic', cv=5)
+        calibrated.fit(X, y)
+        best_model = calibrated
+        print(f"  📐 Calibración isotónica aplicada")
+    except Exception as e:
+        print(f"  ⚠️  Calibración falló ({e}) — usando modelo sin calibrar")
 
     return best_model, best_name, best_score
 

@@ -4,10 +4,15 @@ import psycopg2
 import psycopg2.pool
 import os
 import logging
+import struct
+import base64
+import time
+import requests as _requests
 from datetime import datetime
 from dotenv import load_dotenv
+from solders.pubkey import Pubkey
 
-load_dotenv()
+load_dotenv('/root/solana_bot/.env')
 
 logging.basicConfig(
     level=logging.INFO,
@@ -59,6 +64,138 @@ def setup_db():
         log.info("✅ Columnas de precio añadidas")
     finally:
         pool.putconn(conn)
+
+# ── BONDING CURVE PRICING ─────────────────────────────
+PUMP_PROGRAM     = Pubkey.from_string("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P")
+PUBLIC_RPC       = "https://api.mainnet-beta.solana.com"
+PUMP_TOTAL_SUPPLY = 1_000_000_000        # 1B tokens total supply
+BC_INITIAL_SOL    = 30.0                 # virtual SOL at start (lamports / 1e9)
+AVG_BUY_SOL       = 0.1                 # average SOL per buy tx (estimate)
+
+_sol_price_cache  = {"price": 150.0, "ts": 0.0}
+
+def get_sol_price() -> float:
+    """Returns cached SOL/USD price, refreshed every 5 minutes."""
+    if time.time() - _sol_price_cache["ts"] > 300:
+        try:
+            r = _requests.get(
+                "https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd",
+                timeout=8
+            )
+            _sol_price_cache["price"] = r.json()["solana"]["usd"]
+            _sol_price_cache["ts"]    = time.time()
+        except Exception:
+            pass
+    return _sol_price_cache["price"]
+
+def get_bonding_curve_address(mint_str: str) -> str:
+    mint = Pubkey.from_string(mint_str)
+    pda, _ = Pubkey.find_program_address([b"bonding-curve", bytes(mint)], PUMP_PROGRAM)
+    return str(pda)
+
+def fetch_bc_prices_batch(mints: list[str]) -> dict[str, dict]:
+    """
+    Fetches bonding curve account data for up to 100 mints at once.
+    Returns {mint: {price_usd, market_cap, buys_5m}} for tokens still in the curve.
+    """
+    if not mints:
+        return {}
+
+    sol_price = get_sol_price()
+    bc_addrs  = [get_bonding_curve_address(m) for m in mints]
+
+    results = {}
+    # Public RPC only — Helius is reserved for main data
+    for start in range(0, len(bc_addrs), 100):
+        batch_mints = mints[start:start+100]
+        batch_addrs = bc_addrs[start:start+100]
+        try:
+            payload = {
+                "jsonrpc": "2.0", "id": 1,
+                "method": "getMultipleAccounts",
+                "params": [batch_addrs, {"encoding": "base64"}]
+            }
+            resp = _requests.post(PUBLIC_RPC, json=payload, timeout=15).json()
+            values = resp.get("result", {}).get("value", [])
+            for mint, val in zip(batch_mints, values):
+                if not val:
+                    continue
+                data = base64.b64decode(val["data"][0])
+                if len(data) < 49:
+                    continue
+                vt       = struct.unpack_from('<Q', data, 8)[0]   # virtual token reserves
+                vs       = struct.unpack_from('<Q', data, 16)[0]  # virtual sol reserves (lamports)
+                rs       = struct.unpack_from('<Q', data, 32)[0]  # real sol reserves (lamports)
+                complete = bool(data[48])
+                if complete or vt == 0:
+                    continue  # graduated — DexScreener will have it
+
+                vs_sol       = vs / 1e9
+                rs_sol       = rs / 1e9  # actual SOL from buyers
+                price_sol    = vs_sol / (vt / 1e6)  # SOL per token (vt in base units)
+                price_usd    = price_sol * sol_price
+                market_cap   = price_usd * PUMP_TOTAL_SUPPLY
+
+                # Estimate buys from real SOL raised (avg 0.1 SOL per buy)
+                est_buys = max(0, min(100, round(rs_sol / AVG_BUY_SOL)))
+
+                results[mint] = {
+                    "price_usd":  round(price_usd, 10),
+                    "market_cap": round(market_cap, 2),
+                    "buys_5m":    est_buys,
+                    "sells_5m":   0,  # conservative — can't distinguish from BC
+                }
+        except Exception as e:
+            log.debug(f"BC batch error: {e}")
+
+    return results
+
+def get_tokens_without_price(limit=200) -> list[str]:
+    """Tokens created in last 3h with no DexScreener price yet."""
+    conn = pool.getconn()
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT mint FROM discovered_tokens
+            WHERE price_usd IS NULL
+              AND created_at > NOW() - INTERVAL '3 hours'
+              AND mint LIKE '%%pump'
+            ORDER BY created_at DESC
+            LIMIT %s
+        """, (limit,))
+        mints = [r[0] for r in cur.fetchall()]
+        cur.close()
+        return mints
+    finally:
+        pool.putconn(conn)
+
+def save_bc_prices(bc_data: dict[str, dict]):
+    """Saves bonding curve prices for tokens that still lack DexScreener data."""
+    if not bc_data:
+        return 0
+    conn = pool.getconn()
+    try:
+        cur = conn.cursor()
+        saved = 0
+        for mint, d in bc_data.items():
+            cur.execute("""
+                UPDATE discovered_tokens SET
+                    price_usd        = %s,
+                    market_cap       = %s,
+                    buys_5m          = COALESCE(buys_5m, %s),
+                    sells_5m         = COALESCE(sells_5m, %s),
+                    price_updated_at = NOW()
+                WHERE mint = %s AND price_usd IS NULL
+            """, (d["price_usd"], d["market_cap"],
+                  d["buys_5m"], d["sells_5m"], mint))
+            if cur.rowcount > 0:
+                saved += 1
+        conn.commit()
+        cur.close()
+        return saved
+    finally:
+        pool.putconn(conn)
+
 
 async def fetch_price(session, mint):
     url = f"https://api.dexscreener.com/latest/dex/tokens/{mint}"
@@ -179,7 +316,16 @@ async def main():
             results = await asyncio.gather(*[fetch_with_sem(m) for m in mints])
 
         success = save_prices(results)
-        log.info(f"💰 Precios actualizados: {success}/{len(mints)}")
+        log.info(f"💰 Precios DexScreener: {success}/{len(mints)}")
+
+        # ── BONDING CURVE para tokens sin precio DexScreener ──
+        bc_mints = get_tokens_without_price(200)
+        if bc_mints:
+            bc_data = fetch_bc_prices_batch(bc_mints)
+            bc_saved = save_bc_prices(bc_data)
+            if bc_saved:
+                log.info(f"⛓️  Bonding curve: {bc_saved}/{len(bc_mints)} tokens con precio inicial")
+
         await asyncio.sleep(30)
 
 if __name__ == "__main__":

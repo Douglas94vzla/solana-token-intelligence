@@ -53,19 +53,19 @@ TRAILING_REENTRY_COOLDOWN = 15   # Minutos de espera antes de re-entrada tras tr
 # STANDARD = cuenta principal (paper_capital). Las otras son simulaciones.
 STRATEGIES = {
     'CONSERVATIVE': {
-        'ml_min':         80,       # Solo señales de muy alta confianza
+        'ml_min':         50,       # ML calibrado ≥50% (2x base rate ~23%)
         'max_open':        2,       # Máximo 2 trades simultáneos
         'size_pct':       0.01,     # 1% fijo por trade (preservar capital)
         'initial_capital': 333.0,   # Capital inicial de la estrategia
     },
     'STANDARD': {
-        'ml_min':         65,       # Filtro ML actual
+        'ml_min':         35,       # ML calibrado ≥35% (1.5x base rate)
         'max_open':        3,       # Máximo 3 trades (existente)
         'size_pct':       None,     # Usa Kelly sizing
         'initial_capital': 333.0,   # Capital inicial de la estrategia
     },
     'AGGRESSIVE': {
-        'ml_min':         65,       # Mismo filtro ML
+        'ml_min':         35,       # Mismo filtro ML que STANDARD
         'max_open':        3,       # Máximo 3 trades
         'size_pct':       0.05,     # 5% fijo (apuesta mayor en cada trade)
         'initial_capital': 333.0,   # Capital inicial de la estrategia
@@ -415,8 +415,11 @@ def check_new_signals(ml_min=65):
             WHERE dt.entry_signal = 'ENTER'
               AND dt.ml_probability >= %s
               AND dt.entry_at > NOW() - INTERVAL '30 minutes'
-              AND dt.market_cap >= 10000
-              AND (dt.liquidity_usd >= 5000 OR (dt.liquidity_usd IS NULL AND dt.market_cap >= 20000))
+              AND dt.market_cap >= 2000
+              AND (
+                dt.pair_address IS NULL                    -- bonding curve: sin par DexScreener
+                OR dt.liquidity_usd >= 3000               -- con par: liquidez mínima
+              )
               AND dt.mint NOT IN (
                   SELECT mint FROM paper_trades
                   WHERE status = 'OPEN'
@@ -687,7 +690,7 @@ def run():
                 last_signal_check = now
                 if is_trading_hours():
                     # Señales ordenadas por ML prob (ml_min=65 es el filtro más amplio)
-                    signals = check_new_signals(ml_min=65)
+                    signals = check_new_signals(ml_min=35)
                     for sig in signals:
                         mint, name, symbol, price, ml_prob, score, narrative, liquidity = sig
                         if not price:

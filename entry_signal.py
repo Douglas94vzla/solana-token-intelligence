@@ -31,9 +31,9 @@ pool = psycopg2.pool.ThreadedConnectionPool(
 
 MODEL_PATH = '/root/solana_bot/model.pkl'
 FEATURES_PATH = '/root/solana_bot/features.pkl'
-ML_THRESHOLD      = 0.65    # Probabilidad mínima para ENTER
+ML_THRESHOLD      = 0.35    # Probabilidad mínima para ENTER (calibrada: base rate ~23%)
 RUG_THRESHOLD     = 60     # Rug score máximo permitido
-MIN_LIQUIDITY_USD = 10_000 # Liquidez mínima en USD para abrir trade
+MIN_LIQUIDITY_USD = 3_000  # Liquidez mínima en USD para abrir trade
 
 # ── CARGAR MODELO ML ──────────────────────────────────
 def load_ml_model():
@@ -357,7 +357,7 @@ def check_quality_filters(mint):
     try:
         cur = conn.cursor()
         cur.execute("""
-            SELECT rug_flags, liquidity_usd, twitter, telegram, website
+            SELECT rug_flags, liquidity_usd, pair_address
             FROM discovered_tokens WHERE mint = %s
         """, (mint,))
         row = cur.fetchone()
@@ -365,20 +365,18 @@ def check_quality_filters(mint):
         if not row:
             return False, ''
 
-        rug_flags, liquidity_usd, twitter, telegram, website = row
+        rug_flags, liquidity_usd, pair_address = row
 
         # 1) ONLY_0_HOLDERS — hard block
         if rug_flags and 'ONLY_0_HOLDERS' in rug_flags:
             return True, 'ONLY_0_HOLDERS (sin holders on-chain)'
 
-        # 2) Liquidez mínima
-        liq = float(liquidity_usd) if liquidity_usd is not None else 0.0
-        if liq < MIN_LIQUIDITY_USD:
-            return True, f'liquidez insuficiente (${liq:,.0f} < ${MIN_LIQUIDITY_USD:,})'
-
-        # 3) Sin presencia social
-        if not twitter and not telegram and not website:
-            return True, 'sin presencia social (twitter/telegram/website)'
+        # 2) Liquidez mínima — solo aplica a tokens con par DexScreener
+        # Tokens en bonding curve (sin pair_address) no tienen liquidity_usd
+        if pair_address is not None:
+            liq = float(liquidity_usd) if liquidity_usd is not None else 0.0
+            if liq < MIN_LIQUIDITY_USD:
+                return True, f'liquidez insuficiente (${liq:,.0f} < ${MIN_LIQUIDITY_USD:,})'
 
         return False, ''
     finally:

@@ -204,8 +204,9 @@ def record_wallet_activity(wallet: str, mint: str, slot: int, signature: str):
             ON CONFLICT (wallet, mint, action) DO NOTHING
         """, (wallet, mint, slot, signature))
         conn.commit()
+        if cur.rowcount > 0:
+            log.info(f"🧠 Smart wallet {wallet[:12]}... bought {mint[:12]}... | slot={slot}")
         cur.close()
-        log.info(f"🧠 Smart wallet {wallet[:12]}... bought {mint[:12]}... | slot={slot}")
     except Exception as e:
         log.warning(f"record_wallet_activity error: {e}")
     finally:

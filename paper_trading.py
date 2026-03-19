@@ -569,6 +569,12 @@ def _apply_pnl_to_cap(cap, strategy, pnl, trade_size, is_win):
             update_strategy_capital(strategy, scap['capital'],
                                     scap['wins'], scap['losses'], scap['total_pnl'])
 
+# Contador de ciclos sin precio por trade_id (en memoria)
+_no_price_count: dict[int, int] = {}
+# Máx ciclos sin precio antes de cerrar al stop máximo (6 × 10s = 60s)
+NO_PRICE_LIMIT = 6
+
+
 def manage_open_trades(cap):
     """Revisa y gestiona todas las posiciones abiertas. Llamado cada 10s."""
     open_trades = get_open_trades()
@@ -578,7 +584,20 @@ def manage_open_trades(cap):
 
         current_price = get_current_price(mint)
         if not current_price:
+            _no_price_count[tid] = _no_price_count.get(tid, 0) + 1
+            if _no_price_count[tid] >= NO_PRICE_LIMIT:
+                # Sin precio por 60s+: cerrar al precio de stop máximo
+                forced_price = float(entry_price) * STOP_LOSS
+                log.warning(f"⚠️  SIN PRECIO #{tid} | {name or mint[:8]} | "
+                            f"{_no_price_count[tid]} ciclos sin datos — cerrando al stop máximo")
+                pnl, pnl_pct = close_trade(
+                    tid, mint, name, entry_price,
+                    float(trade_size), forced_price, "STOP_LOSS", strategy
+                )
+                _apply_pnl_to_cap(cap, strategy, pnl, trade_size, False)
+                _no_price_count.pop(tid, None)
             continue
+        _no_price_count.pop(tid, None)  # reset al recuperar precio
 
         entry = float(entry_price)
         peak  = float(peak_price) if peak_price else entry

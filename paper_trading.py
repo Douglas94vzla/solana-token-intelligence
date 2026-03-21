@@ -47,28 +47,41 @@ SIGNAL_CHECK_INTERVAL   = 60     # Buscar señales nuevas cada 60s
 STOP_LOSS_MIN         = 0.85     # Stop adaptativo mínimo: -15%
 STOP_LOSS_MAX         = 0.70     # Stop adaptativo máximo: -30%
 TRAILING_REENTRY_COOLDOWN = 15   # Minutos de espera antes de re-entrada tras trailing stop
+EARLY_TOKEN_MAX_MINUTES   = 15   # EARLY_ENTRY: máxima edad del token en minutos
 
 # ── MULTI-STRATEGY CONFIG (mejora 14) ─────────────────
 # Cada estrategia corre en paralelo con su propio capital virtual.
 # STANDARD = cuenta principal (paper_capital). Las otras son simulaciones.
+# signal_source: 'standard' → usa check_new_signals() (requiere entry_signal=ENTER)
+#                'early'    → usa check_early_entry_signals() (sin filtros de social/liquidez)
 STRATEGIES = {
     'CONSERVATIVE': {
-        'ml_min':         50,       # ML calibrado ≥50% (2x base rate ~23%)
-        'max_open':        2,       # Máximo 2 trades simultáneos
-        'size_pct':       0.01,     # 1% fijo por trade (preservar capital)
-        'initial_capital': 333.0,   # Capital inicial de la estrategia
+        'ml_min':          50,
+        'max_open':         2,
+        'size_pct':        0.01,
+        'initial_capital': 333.0,
+        'signal_source':   'standard',
     },
     'STANDARD': {
-        'ml_min':         35,       # ML calibrado ≥35% (1.5x base rate)
-        'max_open':        3,       # Máximo 3 trades (existente)
-        'size_pct':       None,     # Usa Kelly sizing
-        'initial_capital': 333.0,   # Capital inicial de la estrategia
+        'ml_min':          35,
+        'max_open':         3,
+        'size_pct':        None,    # Usa Kelly sizing
+        'initial_capital': 333.0,
+        'signal_source':   'standard',
     },
     'AGGRESSIVE': {
-        'ml_min':         35,       # Mismo filtro ML que STANDARD
-        'max_open':        3,       # Máximo 3 trades
-        'size_pct':       0.05,     # 5% fijo (apuesta mayor en cada trade)
-        'initial_capital': 333.0,   # Capital inicial de la estrategia
+        'ml_min':          35,
+        'max_open':         3,
+        'size_pct':        0.05,
+        'initial_capital': 333.0,
+        'signal_source':   'standard',
+    },
+    'EARLY_ENTRY': {
+        'ml_min':          65,      # ML ≥65% (único filtro relevante para tokens <15min)
+        'max_open':         3,
+        'size_pct':        0.02,    # 2% fijo
+        'initial_capital': 333.0,
+        'signal_source':   'early', # Query propia: age<15min, sin social/liquidez
     },
 }
 
@@ -226,7 +239,7 @@ def kelly_size(ml_prob, capital):
     Retorna (trade_size_usd, pct_aplicado).
     Clampado entre 1% y 5% del capital.
     """
-    p = (ml_prob or 65) / 100.0
+    p = float(ml_prob or 65) / 100.0
     b = (TAKE_PROFIT - 1) / (1 - STOP_LOSS)   # 0.50 / 0.30 ≈ 1.667
     kelly_f    = (p * b - (1 - p)) / b
     half_kelly = max(0.0, kelly_f / 2.0)
@@ -437,6 +450,39 @@ def check_new_signals(ml_min=65):
     finally:
         pool.putconn(conn)
 
+def check_early_entry_signals():
+    """
+    Señales para EARLY_ENTRY: tokens con menos de EARLY_TOKEN_MAX_MINUTES minutos de vida,
+    ML >= 65%, sin exigir entry_signal='ENTER' ni filtros de social/liquidez.
+    Consulta directamente discovered_tokens independientemente del pipeline de entry_signal.
+    """
+    conn = pool.getconn()
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT dt.mint, dt.name, dt.symbol, dt.price_usd,
+                   dt.ml_probability, dt.survival_score, dt.narrative,
+                   dt.liquidity_usd
+            FROM discovered_tokens dt
+            WHERE dt.ml_probability >= 65
+              AND dt.created_at > NOW() - INTERVAL '%s minutes'
+              AND dt.price_usd IS NOT NULL
+              AND dt.market_cap >= 1000
+              AND dt.mint NOT IN (
+                  SELECT mint FROM paper_trades
+                  WHERE strategy = 'EARLY_ENTRY'
+                    AND (status = 'OPEN'
+                         OR opened_at > NOW() - INTERVAL '2 hours')
+              )
+            ORDER BY dt.ml_probability DESC
+            LIMIT 5
+        """ % EARLY_TOKEN_MAX_MINUTES)
+        rows = cur.fetchall()
+        cur.close()
+        return rows
+    finally:
+        pool.putconn(conn)
+
 def is_daily_limit_hit():
     cap = get_capital()
     return cap['daily_pnl'] / INITIAL_CAPITAL < -DAILY_LOSS_LIMIT
@@ -492,6 +538,24 @@ def reset_daily_pnl():
     finally:
         pool.putconn(conn)
 
+def sync_paper_capital():
+    """Mantiene paper_capital sincronizado como agregado de todas las estrategias."""
+    conn = pool.getconn()
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            UPDATE paper_capital SET
+                capital    = (SELECT COALESCE(SUM(capital),   0) FROM strategy_capital),
+                total_pnl  = (SELECT COALESCE(SUM(total_pnl), 0) FROM strategy_capital),
+                wins       = (SELECT COALESCE(SUM(wins),      0) FROM strategy_capital),
+                losses     = (SELECT COALESCE(SUM(losses),    0) FROM strategy_capital),
+                updated_at = NOW()
+        """)
+        conn.commit()
+        cur.close()
+    finally:
+        pool.putconn(conn)
+
 def print_summary():
     cap = get_capital()
     conn = pool.getconn()
@@ -535,9 +599,9 @@ def print_summary():
                 s_cap  = cap['capital']
                 s_init = INITIAL_CAPITAL
             else:
-                scap   = get_strategy_capital(strat_name)
-                s_cap  = scap['capital'] if scap else scfg['initial_capital']
-                s_init = scfg['initial_capital']
+                scap_row = get_strategy_capital(strat_name)
+                s_cap    = scap_row['capital'] if scap_row else scfg['initial_capital']
+                s_init   = scfg['initial_capital']
             cur.execute("""
                 SELECT COUNT(*), COUNT(CASE WHEN pnl > 0 THEN 1 END)
                 FROM paper_trades WHERE status = 'CLOSED'
@@ -555,7 +619,7 @@ def print_summary():
         pool.putconn(conn)
 
 def _apply_pnl_to_cap(cap, strategy, pnl, trade_size, is_win):
-    """Actualiza el capital correcto según la estrategia."""
+    """Actualiza el capital correcto según la estrategia y sincroniza paper_capital."""
     if strategy == 'STANDARD':
         cap['capital']   += float(trade_size) + pnl
         cap['daily_pnl'] += pnl
@@ -571,6 +635,8 @@ def _apply_pnl_to_cap(cap, strategy, pnl, trade_size, is_win):
             scap['wins' if is_win else 'losses'] += 1
             update_strategy_capital(strategy, scap['capital'],
                                     scap['wins'], scap['losses'], scap['total_pnl'])
+    # Mantener paper_capital como agregado de todas las estrategias
+    sync_paper_capital()
 
 # Contador de ciclos sin precio por trade_id (en memoria)
 _no_price_count: dict[int, int] = {}
@@ -655,6 +721,7 @@ def manage_open_trades(cap):
 
 def run():
     setup_db()
+    sync_paper_capital()   # Sincronizar al arrancar por si hay deriva acumulada
     log.info("💰 Paper Trading Engine arrancando...")
     log.info(f"⏱  Ciclo posiciones: {POSITION_CHECK_INTERVAL}s | Ciclo señales: {SIGNAL_CHECK_INTERVAL}s")
     alert_system_status("OK", "Paper Trading Engine iniciado")
@@ -689,20 +756,20 @@ def run():
             if now - last_signal_check >= SIGNAL_CHECK_INTERVAL:
                 last_signal_check = now
                 if is_trading_hours():
-                    # Señales ordenadas por ML prob (ml_min=65 es el filtro más amplio)
+                    # ── Estrategias standard (requieren entry_signal='ENTER') ──
                     signals = check_new_signals(ml_min=35)
                     for sig in signals:
                         mint, name, symbol, price, ml_prob, score, narrative, liquidity = sig
                         if not price:
                             continue
-                        # ── Evaluar cada estrategia para este token ───────
                         for strat_name, scfg in STRATEGIES.items():
+                            if scfg['signal_source'] != 'standard':
+                                continue
                             if (ml_prob or 0) < scfg['ml_min']:
                                 continue
                             open_count = len(get_open_trades(strategy=strat_name))
                             if open_count >= scfg['max_open']:
                                 continue
-                            # Calcular tamaño según estrategia
                             if strat_name == 'STANDARD':
                                 cap = get_capital()
                                 t_size, size_pct = kelly_size(ml_prob or 65, cap['capital'])
@@ -716,7 +783,6 @@ def run():
                             open_trade(mint, name, symbol, price,
                                        ml_prob, score, narrative, t_size,
                                        strategy=strat_name, liquidity_usd=liquidity)
-                            # Descontar capital de la estrategia correspondiente
                             if strat_name == 'STANDARD':
                                 cap = get_capital()
                                 cap['capital'] -= t_size
@@ -727,6 +793,32 @@ def run():
                                     scap['capital'] -= t_size
                                     update_strategy_capital(strat_name, scap['capital'],
                                                             scap['wins'], scap['losses'], scap['total_pnl'])
+
+                    # ── EARLY_ENTRY: tokens <15min, ML>=65%, sin filtros de social/liquidez ──
+                    scfg_ee = STRATEGIES['EARLY_ENTRY']
+                    early_signals = check_early_entry_signals()
+                    for sig in early_signals:
+                        mint, name, symbol, price, ml_prob, score, narrative, liquidity = sig
+                        if not price:
+                            continue
+                        if (ml_prob or 0) < scfg_ee['ml_min']:
+                            continue
+                        open_count = len(get_open_trades(strategy='EARLY_ENTRY'))
+                        if open_count >= scfg_ee['max_open']:
+                            break  # todas las ranuras ocupadas, no seguir iterando
+                        scap = get_strategy_capital('EARLY_ENTRY')
+                        if not scap:
+                            continue
+                        t_size = round(scap['capital'] * scfg_ee['size_pct'], 2)
+                        log.info(f"💰 [EARLY_ENTRY] Fixed: {scfg_ee['size_pct']*100:.0f}% = ${t_size:.2f} | ML={ml_prob}% | age<{EARLY_TOKEN_MAX_MINUTES}min")
+                        open_trade(mint, name, symbol, price,
+                                   ml_prob, score, narrative, t_size,
+                                   strategy='EARLY_ENTRY', liquidity_usd=liquidity)
+                        scap = get_strategy_capital('EARLY_ENTRY')
+                        if scap:
+                            scap['capital'] -= t_size
+                            update_strategy_capital('EARLY_ENTRY', scap['capital'],
+                                                    scap['wins'], scap['losses'], scap['total_pnl'])
                 else:
                     hour = datetime.now(timezone.utc).hour
                     log.debug(f"🌙 Fuera de horario ({hour}h UTC) — no se abren nuevos trades")

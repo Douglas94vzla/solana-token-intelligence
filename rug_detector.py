@@ -81,9 +81,11 @@ def get_token_largest_accounts(mint):
     }
     try:
         resp = requests.post(RPC_URL, json=payload, timeout=10).json()
+        if "error" in resp:
+            return None  # RPC error (rate limit, etc.) — treat as unknown
         return resp.get("result", {}).get("value", [])
     except Exception:
-        return []
+        return None
 
 def get_token_supply(mint):
     """Obtiene el supply total del token"""
@@ -152,14 +154,15 @@ def analyze_rug_risk(mint):
     # ── 1. CONCENTRACIÓN DE HOLDERS ──────────────────
     holders = get_token_largest_accounts(mint)
     supply = get_token_supply(mint)
-    
+
     top10_pct = 0
-    holder_count = len(holders)
-    
+    # holders is None when RPC returned an error (rate limit, etc.) — skip holder checks
+    holder_count = len(holders) if holders is not None else None
+
     if holders and supply > 0:
         top10_amount = sum(float(h.get("uiAmount", 0)) for h in holders[:10])
         top10_pct = (top10_amount / supply * 100) if supply > 0 else 0
-        
+
         if top10_pct > 95 and holder_count < 10:
             risk_score += 40
             flags.append(f"TOP10_HOLDS_{top10_pct:.0f}%")
@@ -204,12 +207,13 @@ def analyze_rug_risk(mint):
         flags.append("NEAR_ZERO_LIQUIDITY")
 
     # ── 5. POCOS HOLDERS ─────────────────────────────
-    if holder_count < 5:
-        risk_score += 20
-        flags.append(f"ONLY_{holder_count}_HOLDERS")
-    elif holder_count < 10:
-        risk_score += 10
-        flags.append(f"FEW_HOLDERS_{holder_count}")
+    if holder_count is not None:
+        if holder_count < 5:
+            risk_score += 20
+            flags.append(f"ONLY_{holder_count}_HOLDERS")
+        elif holder_count < 10:
+            risk_score += 10
+            flags.append(f"FEW_HOLDERS_{holder_count}")
 
     # ── 6. HISTORIAL DEL DEPLOYER ────────────────────
     deployer_info = get_deployer_history(mint)

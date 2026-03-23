@@ -41,7 +41,8 @@ def setup_db():
                 ADD COLUMN IF NOT EXISTS top10_concentration NUMERIC(5,2) DEFAULT NULL,
                 ADD COLUMN IF NOT EXISTS holder_count INTEGER DEFAULT NULL,
                 ADD COLUMN IF NOT EXISTS dev_sold BOOLEAN DEFAULT FALSE,
-                ADD COLUMN IF NOT EXISTS rug_checked_at TIMESTAMP DEFAULT NULL
+                ADD COLUMN IF NOT EXISTS rug_checked_at TIMESTAMP DEFAULT NULL,
+                ADD COLUMN IF NOT EXISTS funding_wallet TEXT DEFAULT NULL
             """)
             conn.commit()
         except Exception as e:
@@ -138,6 +139,114 @@ def get_recent_large_sells(mint):
     except Exception:
         return False, 0, 0, 0, 0
 
+def get_deployer_wallet_for_mint(mint):
+    """Obtiene la wallet del deployer desde discovered_tokens."""
+    conn = pool.getconn()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT deployer_wallet, funding_wallet FROM discovered_tokens WHERE mint = %s", (mint,))
+        row = cur.fetchone()
+        cur.close()
+        return (row[0], row[1]) if row else (None, None)
+    except Exception:
+        return (None, None)
+    finally:
+        pool.putconn(conn)
+
+
+def get_funding_wallet(deployer_wallet):
+    """
+    Obtiene la wallet que financió al deployer (primera tx de SOL recibida).
+    Usa getSignaturesForAddress + getTransaction del RPC de Solana.
+    """
+    if not deployer_wallet:
+        return None
+    try:
+        payload = {
+            "jsonrpc": "2.0", "id": 1,
+            "method": "getSignaturesForAddress",
+            "params": [deployer_wallet, {"limit": 50, "commitment": "confirmed"}]
+        }
+        resp = requests.post(RPC_URL, json=payload, timeout=10).json()
+        if "error" in resp:
+            return None
+        signatures = resp.get("result", [])
+        if not signatures:
+            return None
+
+        # Examinar las más antiguas (al final de la lista)
+        for sig_info in reversed(signatures[-10:]):
+            sig = sig_info.get("signature")
+            if not sig:
+                continue
+            try:
+                tx_payload = {
+                    "jsonrpc": "2.0", "id": 1,
+                    "method": "getTransaction",
+                    "params": [sig, {
+                        "encoding": "jsonParsed",
+                        "commitment": "confirmed",
+                        "maxSupportedTransactionVersion": 0
+                    }]
+                }
+                tx_resp = requests.post(RPC_URL, json=tx_payload, timeout=10).json()
+                tx = tx_resp.get("result")
+                if not tx:
+                    continue
+
+                meta          = tx.get("meta", {})
+                pre_balances  = meta.get("preBalances", [])
+                post_balances = meta.get("postBalances", [])
+                account_keys  = (tx.get("transaction", {})
+                                   .get("message", {})
+                                   .get("accountKeys", []))
+
+                for i, key_info in enumerate(account_keys):
+                    key = key_info.get("pubkey") if isinstance(key_info, dict) else key_info
+                    if (key == deployer_wallet
+                            and i < len(pre_balances)
+                            and i < len(post_balances)):
+                        # El deployer recibió SOL (al menos 0.001 SOL)
+                        if post_balances[i] > pre_balances[i] + 1_000_000:
+                            sender_info = account_keys[0] if account_keys else None
+                            if sender_info:
+                                sender = (sender_info.get("pubkey")
+                                          if isinstance(sender_info, dict)
+                                          else sender_info)
+                                if sender and sender != deployer_wallet:
+                                    return sender
+            except Exception:
+                continue
+        return None
+    except Exception as e:
+        log.debug(f"Error obteniendo funding wallet para {deployer_wallet[:8]}: {e}")
+        return None
+
+
+def check_funding_wallet_rugs(funding_wallet):
+    """
+    Cuenta cuántos tokens con rug_score >= 60 están asociados a esta funding wallet.
+    """
+    if not funding_wallet:
+        return 0
+    conn = pool.getconn()
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT COUNT(DISTINCT mint)
+            FROM discovered_tokens
+            WHERE funding_wallet = %s
+              AND rug_score >= 60
+        """, (funding_wallet,))
+        row = cur.fetchone()
+        cur.close()
+        return int(row[0]) if row else 0
+    except Exception:
+        return 0
+    finally:
+        pool.putconn(conn)
+
+
 def analyze_rug_risk(mint):
     """
     Analiza el riesgo de rug de un token.
@@ -226,6 +335,23 @@ def analyze_rug_risk(mint):
             risk_score += 15
             flags.append(f"SUSPICIOUS_DEPLOYER_{rugged}of{total}tokens")
 
+    # ── 7. FUNDING WALLET (SERIAL RUGGER POR WALLET MADRE) ────
+    # El deployer de cada rug es una wallet nueva, pero la wallet que la
+    # financió (envió SOL inicial) suele ser siempre la misma.
+    funding_wallet = None
+    deployer_wallet, saved_funding = get_deployer_wallet_for_mint(mint)
+    if deployer_wallet:
+        # Reutilizar funding_wallet ya guardada para evitar llamadas RPC repetidas
+        funding_wallet = saved_funding or get_funding_wallet(deployer_wallet)
+        if funding_wallet:
+            rug_count = check_funding_wallet_rugs(funding_wallet)
+            if rug_count >= 2:
+                penalty = min(40, rug_count * 15)   # 15 pts/rug, cap +40
+                risk_score += penalty
+                flags.append(f"SERIAL_RUGGER_{rug_count}RUGS")
+                log.info(f"🚨 SERIAL RUGGER | {mint[:8]} | "
+                         f"Funding: {funding_wallet[:8]} | {rug_count} rugs previos")
+
     # ── CLASIFICACIÓN FINAL ──────────────────────────
     risk_score = min(risk_score, 100)
     
@@ -239,13 +365,14 @@ def analyze_rug_risk(mint):
         verdict = "🟢 SAFE"
 
     return {
-        "rug_score": risk_score,
-        "verdict": verdict,
-        "flags": ", ".join(flags) if flags else "NONE",
-        "top10_pct": top10_pct,
-        "holder_count": holder_count,
+        "rug_score":      risk_score,
+        "verdict":        verdict,
+        "flags":          ", ".join(flags) if flags else "NONE",
+        "top10_pct":      top10_pct,
+        "holder_count":   holder_count,
         "mint_authority": bool(mint_authority),
         "freeze_authority": bool(freeze_authority),
+        "funding_wallet": funding_wallet,
     }
 
 def save_rug_analysis(mint, analysis):
@@ -254,17 +381,19 @@ def save_rug_analysis(mint, analysis):
         cur = conn.cursor()
         cur.execute("""
             UPDATE discovered_tokens SET
-                rug_score = %s,
-                rug_flags = %s,
+                rug_score           = %s,
+                rug_flags           = %s,
                 top10_concentration = %s,
-                holder_count = %s,
-                rug_checked_at = NOW()
+                holder_count        = %s,
+                funding_wallet      = COALESCE(%s, funding_wallet),
+                rug_checked_at      = NOW()
             WHERE mint = %s
         """, (
             analysis["rug_score"],
             analysis["flags"],
             analysis["top10_pct"],
             analysis["holder_count"],
+            analysis.get("funding_wallet"),
             mint
         ))
         conn.commit()

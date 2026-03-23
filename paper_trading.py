@@ -33,11 +33,12 @@ pool = psycopg2.pool.ThreadedConnectionPool(
 INITIAL_CAPITAL       = 1000.0   # Capital simulado
 TRADE_SIZE_PCT        = 0.02     # 2% por trade
 MAX_OPEN_TRADES       = 3        # Máximo trades simultáneos
-TAKE_PROFIT           = 1.50     # +50% TP
+TAKE_PROFIT           = 1.50     # +50% TP final (50% restante)
+PARTIAL_TP_PCT        = 1.20     # +20% → cierra 50% de la posición y activa trailing
 STOP_LOSS             = 0.70     # -30% stop inicial fijo
 TRAIL_PCT             = 0.20     # Trailing: cierra si cae 20% desde el pico
 TRAIL_ACTIVATE        = 0.10     # Trailing activa solo si el trade subió 10%+
-MAX_HOLD_MINUTES      = 120      # Timeout 2 horas
+MAX_HOLD_MINUTES      = 30       # Timeout 30 minutos (tokens que no despegan en 30min ya no despegan)
 DAILY_LOSS_LIMIT      = 0.03     # Parar si perdemos 3% en el día
 SLIPPAGE              = 0.03     # Slippage base (fallback si no hay liquidez)
 FEES                  = 0.005    # 0.5% fees
@@ -143,6 +144,7 @@ def setup_db():
             cur.execute("ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS stop_loss_pct NUMERIC(6,4)")
             cur.execute("ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS strategy TEXT DEFAULT 'STANDARD'")
             cur.execute("ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS slippage_pct NUMERIC(6,4)")
+            cur.execute("ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS partial_tp_taken BOOLEAN DEFAULT FALSE")
             conn.commit()
         except Exception:
             conn.rollback()
@@ -192,7 +194,8 @@ def get_open_trades(strategy=None):
                        ml_probability, survival_score, opened_at,
                        COALESCE(peak_price, entry_price) as peak_price,
                        COALESCE(stop_loss_pct, %s) as stop_loss_pct,
-                       COALESCE(strategy, 'STANDARD') as strategy
+                       COALESCE(strategy, 'STANDARD') as strategy,
+                       COALESCE(partial_tp_taken, FALSE) as partial_tp_taken
                 FROM paper_trades
                 WHERE status = 'OPEN' AND COALESCE(strategy, 'STANDARD') = %s
                 ORDER BY opened_at ASC
@@ -203,7 +206,8 @@ def get_open_trades(strategy=None):
                        ml_probability, survival_score, opened_at,
                        COALESCE(peak_price, entry_price) as peak_price,
                        COALESCE(stop_loss_pct, %s) as stop_loss_pct,
-                       COALESCE(strategy, 'STANDARD') as strategy
+                       COALESCE(strategy, 'STANDARD') as strategy,
+                       COALESCE(partial_tp_taken, FALSE) as partial_tp_taken
                 FROM paper_trades
                 WHERE status = 'OPEN'
                 ORDER BY opened_at ASC
@@ -624,6 +628,16 @@ def _apply_pnl_to_cap(strategy, pnl, trade_size, is_win):
                                 scap['wins'], scap['losses'], scap['total_pnl'])
     sync_paper_capital()
 
+def _apply_partial_pnl(strategy, pnl, half_size):
+    """Actualiza capital y PnL para partial TP sin contar como win/loss individual."""
+    scap = get_strategy_capital(strategy)
+    if scap:
+        scap['capital']   += float(half_size) + pnl
+        scap['total_pnl'] += pnl
+        update_strategy_capital(strategy, scap['capital'],
+                                scap['wins'], scap['losses'], scap['total_pnl'])
+    sync_paper_capital()
+
 # Contador de ciclos sin precio por trade_id (en memoria)
 _no_price_count: dict[int, int] = {}
 # Máx ciclos sin precio antes de cerrar al stop máximo (6 × 10s = 60s)
@@ -635,7 +649,7 @@ def manage_open_trades():
     open_trades = get_open_trades()
     for trade in open_trades:
         tid, mint, name, symbol, entry_price, trade_size, \
-            ml_prob, score, opened_at, peak_price, stop_loss_pct, strategy = trade
+            ml_prob, score, opened_at, peak_price, stop_loss_pct, strategy, partial_tp_taken = trade
 
         current_price = get_current_price(mint)
         if not current_price:
@@ -662,7 +676,44 @@ def manage_open_trades():
             peak = current_price
             update_peak_price(tid, peak)
 
-        # ── TAKE PROFIT ────────────────────────────
+        # ── PARTIAL TAKE PROFIT (+20%: cerrar 50%) ─────────
+        # Al llegar a +20%, aseguramos la mitad de la posición y
+        # activamos trailing stop inmediato en el 50% restante.
+        if not partial_tp_taken and current_price >= entry * PARTIAL_TP_PCT:
+            half_size = float(trade_size) / 2.0
+            exit_price_partial = current_price * (1 - FEES)
+            pnl_pct_partial = (exit_price_partial - entry) / entry * 100
+            pnl_partial = half_size * (pnl_pct_partial / 100)
+
+            conn_p = pool.getconn()
+            try:
+                cur_p = conn_p.cursor()
+                cur_p.execute("""
+                    UPDATE paper_trades SET
+                        trade_size       = trade_size / 2.0,
+                        partial_tp_taken = TRUE
+                    WHERE id = %s
+                """, (tid,))
+                conn_p.commit()
+                cur_p.close()
+            finally:
+                pool.putconn(conn_p)
+
+            log.info(f"💰 PARTIAL_TP #{tid} [{strategy}] | {name or mint[:8]} | "
+                     f"+{pnl_pct_partial:.1f}% | 50% cerrado: ${pnl_partial:+.2f} | "
+                     f"Restante: ${half_size:.2f} | Trailing activo desde ahora")
+            if strategy == 'STANDARD':
+                send_message(
+                    f"💰 PARTIAL TP | {name or mint[:8]} | "
+                    f"+{pnl_pct_partial:.1f}% | ${pnl_partial:+.2f} asegurado | "
+                    f"Restante ${half_size:.2f} en trailing"
+                )
+            _apply_partial_pnl(strategy, pnl_partial, half_size)
+            # Actualizar variables locales para los checks siguientes
+            partial_tp_taken = True
+            trade_size = half_size
+
+        # ── TAKE PROFIT (50% restante, o 100% si no hubo partial) ──
         if current_price >= entry * TAKE_PROFIT:
             pnl, pnl_pct = close_trade(
                 tid, mint, name, entry_price,
@@ -670,10 +721,10 @@ def manage_open_trades():
             )
             _apply_pnl_to_cap(strategy, pnl, trade_size, pnl > 0)
 
-        # ── TRAILING STOP ──────────────────────────
-        # Activa solo si el trade subió TRAIL_ACTIVATE%+
-        # Stop = peak * (1 - TRAIL_PCT)
-        elif (peak >= entry * (1 + TRAIL_ACTIVATE) and
+        # ── TRAILING STOP ───────────────────────────────────
+        # Activa si: partial TP ya tomado (estamos en ganancia garantizada),
+        # O si el trade subió TRAIL_ACTIVATE%+ desde la entrada.
+        elif ((partial_tp_taken or peak >= entry * (1 + TRAIL_ACTIVATE)) and
               current_price <= peak * (1 - TRAIL_PCT)):
             trail_level  = peak * (1 - TRAIL_PCT)
             gain_at_peak = (peak - entry) / entry * 100
@@ -685,7 +736,7 @@ def manage_open_trades():
             )
             _apply_pnl_to_cap(strategy, pnl, trade_size, pnl > 0)
 
-        # ── STOP LOSS ADAPTATIVO ───────────────────
+        # ── STOP LOSS ADAPTATIVO ────────────────────────────
         elif current_price <= entry * float(stop_loss_pct):
             pnl, pnl_pct = close_trade(
                 tid, mint, name, entry_price,
@@ -693,7 +744,7 @@ def manage_open_trades():
             )
             _apply_pnl_to_cap(strategy, pnl, trade_size, False)
 
-        # ── TIMEOUT ────────────────────────────────
+        # ── TIMEOUT ─────────────────────────────────────────
         elif (datetime.now() - opened_at.replace(tzinfo=None) >
               timedelta(minutes=MAX_HOLD_MINUTES)):
             pnl, pnl_pct = close_trade(

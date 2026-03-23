@@ -69,13 +69,6 @@ STRATEGIES = {
         'initial_capital': 333.0,
         'signal_source':   'standard',
     },
-    'AGGRESSIVE': {
-        'ml_min':          35,
-        'max_open':         3,
-        'size_pct':        0.05,
-        'initial_capital': 333.0,
-        'signal_source':   'standard',
-    },
     'EARLY_ENTRY': {
         'ml_min':          65,      # ML ≥65% (único filtro relevante para tokens <15min)
         'max_open':         3,
@@ -428,11 +421,13 @@ def check_new_signals(ml_min=65):
             WHERE dt.entry_signal = 'ENTER'
               AND dt.ml_probability >= %s
               AND dt.entry_at > NOW() - INTERVAL '30 minutes'
-              AND dt.market_cap >= 2000
+              AND dt.market_cap >= 5000
               AND (
                 dt.pair_address IS NULL                    -- bonding curve: sin par DexScreener
                 OR dt.liquidity_usd >= 3000               -- con par: liquidez mínima
               )
+              AND (dt.rug_flags IS NULL OR dt.rug_flags NOT LIKE '%%NEAR_ZERO_LIQUIDITY%%')
+              AND (dt.price_change_1h IS NULL OR dt.price_change_1h > -70)
               AND dt.mint NOT IN (
                   SELECT mint FROM paper_trades
                   WHERE status = 'OPEN'
@@ -618,24 +613,15 @@ def print_summary():
     finally:
         pool.putconn(conn)
 
-def _apply_pnl_to_cap(cap, strategy, pnl, trade_size, is_win):
-    """Actualiza el capital correcto según la estrategia y sincroniza paper_capital."""
-    if strategy == 'STANDARD':
-        cap['capital']   += float(trade_size) + pnl
-        cap['daily_pnl'] += pnl
-        cap['total_pnl'] += pnl
-        cap['wins' if is_win else 'losses'] += 1
-        update_capital(**cap)
-    else:
-        # Actualizar capital de la estrategia alternativa
-        scap = get_strategy_capital(strategy)
-        if scap:
-            scap['capital']   += float(trade_size) + pnl
-            scap['total_pnl'] += pnl
-            scap['wins' if is_win else 'losses'] += 1
-            update_strategy_capital(strategy, scap['capital'],
-                                    scap['wins'], scap['losses'], scap['total_pnl'])
-    # Mantener paper_capital como agregado de todas las estrategias
+def _apply_pnl_to_cap(strategy, pnl, trade_size, is_win):
+    """Actualiza strategy_capital para la estrategia dada y sincroniza paper_capital."""
+    scap = get_strategy_capital(strategy)
+    if scap:
+        scap['capital']   += float(trade_size) + pnl
+        scap['total_pnl'] += pnl
+        scap['wins' if is_win else 'losses'] += 1
+        update_strategy_capital(strategy, scap['capital'],
+                                scap['wins'], scap['losses'], scap['total_pnl'])
     sync_paper_capital()
 
 # Contador de ciclos sin precio por trade_id (en memoria)
@@ -644,7 +630,7 @@ _no_price_count: dict[int, int] = {}
 NO_PRICE_LIMIT = 6
 
 
-def manage_open_trades(cap):
+def manage_open_trades():
     """Revisa y gestiona todas las posiciones abiertas. Llamado cada 10s."""
     open_trades = get_open_trades()
     for trade in open_trades:
@@ -663,7 +649,7 @@ def manage_open_trades(cap):
                     tid, mint, name, entry_price,
                     float(trade_size), forced_price, "STOP_LOSS", strategy
                 )
-                _apply_pnl_to_cap(cap, strategy, pnl, trade_size, False)
+                _apply_pnl_to_cap(strategy, pnl, trade_size, False)
                 _no_price_count.pop(tid, None)
             continue
         _no_price_count.pop(tid, None)  # reset al recuperar precio
@@ -682,7 +668,7 @@ def manage_open_trades(cap):
                 tid, mint, name, entry_price,
                 float(trade_size), current_price, "TAKE_PROFIT", strategy
             )
-            _apply_pnl_to_cap(cap, strategy, pnl, trade_size, pnl > 0)
+            _apply_pnl_to_cap(strategy, pnl, trade_size, pnl > 0)
 
         # ── TRAILING STOP ──────────────────────────
         # Activa solo si el trade subió TRAIL_ACTIVATE%+
@@ -697,7 +683,7 @@ def manage_open_trades(cap):
                 tid, mint, name, entry_price,
                 float(trade_size), current_price, "TRAILING_STOP", strategy
             )
-            _apply_pnl_to_cap(cap, strategy, pnl, trade_size, pnl > 0)
+            _apply_pnl_to_cap(strategy, pnl, trade_size, pnl > 0)
 
         # ── STOP LOSS ADAPTATIVO ───────────────────
         elif current_price <= entry * float(stop_loss_pct):
@@ -705,7 +691,7 @@ def manage_open_trades(cap):
                 tid, mint, name, entry_price,
                 float(trade_size), current_price, "STOP_LOSS", strategy
             )
-            _apply_pnl_to_cap(cap, strategy, pnl, trade_size, False)
+            _apply_pnl_to_cap(strategy, pnl, trade_size, False)
 
         # ── TIMEOUT ────────────────────────────────
         elif (datetime.now() - opened_at.replace(tzinfo=None) >
@@ -714,9 +700,7 @@ def manage_open_trades(cap):
                 tid, mint, name, entry_price,
                 float(trade_size), current_price, "TIMEOUT", strategy
             )
-            _apply_pnl_to_cap(cap, strategy, pnl, trade_size, pnl > 0)
-
-    return cap
+            _apply_pnl_to_cap(strategy, pnl, trade_size, pnl > 0)
 
 
 def run():
@@ -740,11 +724,9 @@ def run():
                 reset_daily_pnl()
                 last_daily_reset = datetime.now().date()
 
-            cap = get_capital()
-
             # ── GESTIONAR POSICIONES ABIERTAS (cada 10s) ───
             # SIEMPRE gestionar posiciones abiertas, incluso con límite diario activo
-            cap = manage_open_trades(cap)
+            manage_open_trades()
 
             # ── LÍMITE DIARIO — bloquea solo apertura de nuevos trades ──
             if is_daily_limit_hit():
@@ -770,29 +752,23 @@ def run():
                             open_count = len(get_open_trades(strategy=strat_name))
                             if open_count >= scfg['max_open']:
                                 continue
-                            if strat_name == 'STANDARD':
-                                cap = get_capital()
-                                t_size, size_pct = kelly_size(ml_prob or 65, cap['capital'])
+                            scap = get_strategy_capital(strat_name)
+                            if not scap:
+                                continue
+                            if scfg['size_pct'] is None:
+                                t_size, size_pct = kelly_size(ml_prob or 65, scap['capital'])
                                 log.info(f"💰 [{strat_name}] Kelly: {size_pct:.1f}% = ${t_size:.2f} | ML={ml_prob}%")
                             else:
-                                scap = get_strategy_capital(strat_name)
-                                if not scap:
-                                    continue
                                 t_size = round(scap['capital'] * scfg['size_pct'], 2)
                                 log.info(f"💰 [{strat_name}] Fixed: {scfg['size_pct']*100:.0f}% = ${t_size:.2f} | ML={ml_prob}%")
                             open_trade(mint, name, symbol, price,
                                        ml_prob, score, narrative, t_size,
                                        strategy=strat_name, liquidity_usd=liquidity)
-                            if strat_name == 'STANDARD':
-                                cap = get_capital()
-                                cap['capital'] -= t_size
-                                update_capital(**cap)
-                            else:
-                                scap = get_strategy_capital(strat_name)
-                                if scap:
-                                    scap['capital'] -= t_size
-                                    update_strategy_capital(strat_name, scap['capital'],
-                                                            scap['wins'], scap['losses'], scap['total_pnl'])
+                            scap = get_strategy_capital(strat_name)
+                            if scap:
+                                scap['capital'] -= t_size
+                                update_strategy_capital(strat_name, scap['capital'],
+                                                        scap['wins'], scap['losses'], scap['total_pnl'])
 
                     # ── EARLY_ENTRY: tokens <15min, ML>=65%, sin filtros de social/liquidez ──
                     scfg_ee = STRATEGIES['EARLY_ENTRY']

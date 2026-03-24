@@ -421,7 +421,7 @@ def compute_entry_signal(current, history):
     if consecutive_up >= 4:       momentum += 30   # fuerte: 4+ snapshots subiendo
     elif consecutive_up >= 3:     momentum += 15   # moderado: 3 consecutivos
 
-    if momentum >= 70:     return 'ENTER', momentum
+    if momentum >= 90:     return 'ENTER', momentum
     elif momentum >= 40:   return 'WATCH', momentum
     elif not price_up and not buy_pressure: return 'EXIT', momentum
     else:                  return 'WAIT', momentum

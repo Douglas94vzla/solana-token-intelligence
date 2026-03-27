@@ -47,7 +47,7 @@ RUG_THRESHOLD     = 70    # rug_score > 70 → token considerado rug
 SERIAL_MIN_TOKENS = 3     # mínimo tokens para calificar como serial rugger
 SERIAL_MIN_RATE   = 0.50  # mínimo rug_rate para ser serial rugger (50%)
 SUSPICIOUS_RATE   = 0.30  # rug_rate medio → sospechoso
-FETCH_BATCH       = 100   # tokens a enriquecer por ciclo
+FETCH_BATCH       = 600   # tokens a enriquecer por ciclo
 
 # RPC pública de Solana — NO usa créditos de Helius
 # Fallback si la primaria falla (rate limit 429)

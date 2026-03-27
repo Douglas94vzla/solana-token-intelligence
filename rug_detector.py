@@ -3,6 +3,7 @@ import psycopg2
 import psycopg2.pool
 import os
 import logging
+import time
 from datetime import datetime
 from dotenv import load_dotenv
 
@@ -19,6 +20,8 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 RPC_URL = os.getenv("RPC_URL")
+# RPC público como fallback para métodos que Helius rate-limita (getSignaturesForAddress)
+PUBLIC_RPC_URL = "https://api.mainnet-beta.solana.com"
 
 pool = psycopg2.pool.ThreadedConnectionPool(
     1, 5,
@@ -157,7 +160,8 @@ def get_deployer_wallet_for_mint(mint):
 def get_funding_wallet(deployer_wallet):
     """
     Obtiene la wallet que financió al deployer (primera tx de SOL recibida).
-    Usa getSignaturesForAddress + getTransaction del RPC de Solana.
+    Usa el RPC público de Solana para evitar rate limits de Helius en
+    getSignaturesForAddress + getTransaction.
     """
     if not deployer_wallet:
         return None
@@ -165,9 +169,9 @@ def get_funding_wallet(deployer_wallet):
         payload = {
             "jsonrpc": "2.0", "id": 1,
             "method": "getSignaturesForAddress",
-            "params": [deployer_wallet, {"limit": 50, "commitment": "confirmed"}]
+            "params": [deployer_wallet, {"limit": 20, "commitment": "confirmed"}]
         }
-        resp = requests.post(RPC_URL, json=payload, timeout=10).json()
+        resp = requests.post(PUBLIC_RPC_URL, json=payload, timeout=10).json()
         if "error" in resp:
             return None
         signatures = resp.get("result", [])
@@ -189,7 +193,7 @@ def get_funding_wallet(deployer_wallet):
                         "maxSupportedTransactionVersion": 0
                     }]
                 }
-                tx_resp = requests.post(RPC_URL, json=tx_payload, timeout=10).json()
+                tx_resp = requests.post(PUBLIC_RPC_URL, json=tx_payload, timeout=10).json()
                 tx = tx_resp.get("result")
                 if not tx:
                     continue
@@ -472,6 +476,50 @@ def print_summary():
     finally:
         pool.putconn(conn)
 
+def get_tokens_missing_funding_wallet():
+    """
+    Tokens que ya fueron rug-checked pero sin funding_wallet porque
+    deployer_wallet llegó después (race condition con metadata_fetcher).
+    Limitado a tokens recientes para no sobrecargar el RPC.
+    """
+    conn = pool.getconn()
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT mint, deployer_wallet
+            FROM discovered_tokens
+            WHERE deployer_wallet IS NOT NULL
+              AND funding_wallet IS NULL
+              AND rug_checked_at IS NOT NULL
+              AND created_at > NOW() - INTERVAL '48 hours'
+            ORDER BY rug_checked_at DESC
+            LIMIT 50
+        """)
+        rows = cur.fetchall()
+        cur.close()
+        return rows
+    finally:
+        pool.putconn(conn)
+
+
+def save_funding_wallet(mint, funding_wallet):
+    """Actualiza solo la columna funding_wallet de un token ya analizado."""
+    conn = pool.getconn()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "UPDATE discovered_tokens SET funding_wallet = %s WHERE mint = %s",
+            (funding_wallet, mint)
+        )
+        conn.commit()
+        cur.close()
+    except Exception as e:
+        conn.rollback()
+        log.error(f"Error guardando funding_wallet para {mint[:16]}: {e}")
+    finally:
+        pool.putconn(conn)
+
+
 def run():
     setup_db()
     tokens = get_unanalyzed_tokens()
@@ -481,7 +529,8 @@ def run():
         try:
             analysis = analyze_rug_risk(mint)
             save_rug_analysis(mint, analysis)
-            
+            time.sleep(0.5)  # evitar rate limit en get_funding_wallet (public RPC)
+
             verdict = analysis["verdict"]
             score   = analysis["rug_score"]
             top10   = analysis["top10_pct"]
@@ -495,6 +544,21 @@ def run():
             )
         except Exception as e:
             log.error(f"Error analizando {mint[:16]}: {e}")
+
+    # Segundo pase: rellenar funding_wallet para tokens ya analizados cuyo
+    # deployer_wallet llegó después (race condition con metadata_fetcher)
+    backfill = get_tokens_missing_funding_wallet()
+    if backfill:
+        log.info(f"🔍 Backfill funding_wallet: {len(backfill)} tokens con deployer pero sin funding")
+        for mint, deployer_wallet in backfill:
+            try:
+                fw = get_funding_wallet(deployer_wallet)
+                if fw:
+                    save_funding_wallet(mint, fw)
+                    log.info(f"💳 Funding wallet encontrada: {mint[:8]} ← {fw[:8]}")
+                time.sleep(0.5)
+            except Exception as e:
+                log.error(f"Error en backfill funding_wallet {mint[:16]}: {e}")
 
     print_summary()
     log.info("✅ Análisis completado")

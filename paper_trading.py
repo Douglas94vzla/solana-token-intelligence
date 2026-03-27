@@ -71,11 +71,12 @@ STRATEGIES = {
         'signal_source':   'standard',
     },
     'EARLY_ENTRY': {
-        'ml_min':          65,      # ML ≥65% (único filtro relevante para tokens <15min)
+        'ml_min':          75,      # ML ≥75% — umbral elevado porque <15min tiene menos datos
         'max_open':         3,
         'size_pct':        0.02,    # 2% fijo
         'initial_capital': 333.0,
         'signal_source':   'early', # Query propia: age<15min, sin social/liquidez
+        'stop_loss':       0.80,    # -20% fijo: tokens <15min no tienen ATR suficiente para adaptativo
     },
 }
 
@@ -325,7 +326,8 @@ def open_trade(mint, name, symbol, price, ml_prob, score, narrative, trade_size,
                strategy='STANDARD', liquidity_usd=None):
     slip        = dynamic_slippage(trade_size, liquidity_usd)   # mejora 13
     entry_price = float(price) * (1 + slip + FEES)
-    stop_pct    = calc_adaptive_stop(mint)
+    strat_stop  = STRATEGIES.get(strategy, {}).get('stop_loss')
+    stop_pct    = strat_stop if strat_stop is not None else calc_adaptive_stop(mint)
 
     conn = pool.getconn()
     try:
@@ -463,10 +465,11 @@ def check_early_entry_signals():
                    dt.ml_probability, dt.survival_score, dt.narrative,
                    dt.liquidity_usd
             FROM discovered_tokens dt
-            WHERE dt.ml_probability >= 65
+            WHERE dt.ml_probability >= 75
               AND dt.created_at > NOW() - INTERVAL '%s minutes'
               AND dt.price_usd IS NOT NULL
               AND dt.market_cap >= 1000
+              AND (dt.rug_score IS NULL OR dt.rug_score < 40)
               AND dt.mint NOT IN (
                   SELECT mint FROM paper_trades
                   WHERE strategy = 'EARLY_ENTRY'

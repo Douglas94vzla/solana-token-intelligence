@@ -49,6 +49,8 @@ STOP_LOSS_MIN         = 0.85     # Stop adaptativo mínimo: -15%
 STOP_LOSS_MAX         = 0.70     # Stop adaptativo máximo: -30%
 TRAILING_REENTRY_COOLDOWN = 15   # Minutos de espera antes de re-entrada tras trailing stop
 EARLY_TOKEN_MAX_MINUTES   = 15   # EARLY_ENTRY: máxima edad del token en minutos
+EMERGENCY_EXIT_PCT        = 0.50 # Emergency exit: salir si precio cae >50% desde entry
+EMERGENCY_EXIT_MINUTES    = 5    # Solo aplica si el trade tiene menos de 5 min de vida
 
 # ── MULTI-STRATEGY CONFIG (mejora 14) ─────────────────
 # Cada estrategia corre en paralelo con su propio capital virtual.
@@ -663,8 +665,9 @@ def manage_open_trades():
             continue
         _no_price_count.pop(tid, None)  # reset al recuperar precio
 
-        entry = float(entry_price)
-        peak  = float(peak_price) if peak_price else entry
+        entry       = float(entry_price)
+        peak        = float(peak_price) if peak_price else entry
+        age_minutes = (datetime.now() - opened_at.replace(tzinfo=None)).total_seconds() / 60
 
         # Actualizar precio pico
         if current_price > peak:
@@ -730,6 +733,22 @@ def manage_open_trades():
                 float(trade_size), current_price, "TRAILING_STOP", strategy
             )
             _apply_pnl_to_cap(strategy, pnl, trade_size, pnl > 0)
+
+        # ── EMERGENCY EXIT (<5min, precio cae >50%) ──────────
+        # En rugs ultrarrápidos el precio cruza el stop de -30% en un solo ciclo de 10s
+        # y close_trade registraría -95%+. Simulamos salida al límite de -50% asumiendo
+        # que una orden límite habría ejecutado antes del fondo.
+        elif (age_minutes < EMERGENCY_EXIT_MINUTES and
+              current_price < entry * EMERGENCY_EXIT_PCT):
+            sim_exit = entry * EMERGENCY_EXIT_PCT
+            log.warning(f"🚨 EMERGENCY EXIT #{tid} [{strategy}] | {name or mint[:8]} | "
+                        f"age={age_minutes:.1f}min | caída real={((current_price/entry)-1)*100:+.1f}% | "
+                        f"salida simulada al -50%: ${sim_exit:.8f}")
+            pnl, pnl_pct = close_trade(
+                tid, mint, name, entry_price,
+                float(trade_size), sim_exit, "EMERGENCY_EXIT", strategy
+            )
+            _apply_pnl_to_cap(strategy, pnl, trade_size, False)
 
         # ── STOP LOSS ADAPTATIVO ────────────────────────────
         elif current_price <= entry * float(stop_loss_pct):

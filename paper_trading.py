@@ -70,14 +70,6 @@ STRATEGIES = {
         'initial_capital': 333.0,
         'signal_source':   'standard',
     },
-    'EARLY_ENTRY': {
-        'ml_min':          75,      # ML ≥75% — umbral elevado porque <15min tiene menos datos
-        'max_open':         3,
-        'size_pct':        0.02,    # 2% fijo
-        'initial_capital': 333.0,
-        'signal_source':   'early', # Query propia: age<15min, sin social/liquidez
-        'stop_loss':       0.80,    # -20% fijo: tokens <15min no tienen ATR suficiente para adaptativo
-    },
 }
 
 def setup_db():
@@ -430,7 +422,7 @@ def check_new_signals(ml_min=65):
               AND dt.market_cap >= 5000
               AND (
                 dt.pair_address IS NULL                    -- bonding curve: sin par DexScreener
-                OR dt.liquidity_usd >= 3000               -- con par: liquidez mínima
+                OR dt.liquidity_usd >= 5000               -- con par: liquidez mínima (subido de 3k)
               )
               AND (dt.rug_flags IS NULL OR dt.rug_flags NOT LIKE '%%NEAR_ZERO_LIQUIDITY%%')
               AND (dt.price_change_1h IS NULL OR dt.price_change_1h > -70)
@@ -824,31 +816,6 @@ def run():
                                 update_strategy_capital(strat_name, scap['capital'],
                                                         scap['wins'], scap['losses'], scap['total_pnl'])
 
-                    # ── EARLY_ENTRY: tokens <15min, ML>=65%, sin filtros de social/liquidez ──
-                    scfg_ee = STRATEGIES['EARLY_ENTRY']
-                    early_signals = check_early_entry_signals()
-                    for sig in early_signals:
-                        mint, name, symbol, price, ml_prob, score, narrative, liquidity = sig
-                        if not price:
-                            continue
-                        if (ml_prob or 0) < scfg_ee['ml_min']:
-                            continue
-                        open_count = len(get_open_trades(strategy='EARLY_ENTRY'))
-                        if open_count >= scfg_ee['max_open']:
-                            break  # todas las ranuras ocupadas, no seguir iterando
-                        scap = get_strategy_capital('EARLY_ENTRY')
-                        if not scap:
-                            continue
-                        t_size = round(scap['capital'] * scfg_ee['size_pct'], 2)
-                        log.info(f"💰 [EARLY_ENTRY] Fixed: {scfg_ee['size_pct']*100:.0f}% = ${t_size:.2f} | ML={ml_prob}% | age<{EARLY_TOKEN_MAX_MINUTES}min")
-                        open_trade(mint, name, symbol, price,
-                                   ml_prob, score, narrative, t_size,
-                                   strategy='EARLY_ENTRY', liquidity_usd=liquidity)
-                        scap = get_strategy_capital('EARLY_ENTRY')
-                        if scap:
-                            scap['capital'] -= t_size
-                            update_strategy_capital('EARLY_ENTRY', scap['capital'],
-                                                    scap['wins'], scap['losses'], scap['total_pnl'])
                 else:
                     hour = datetime.now(timezone.utc).hour
                     log.debug(f"🌙 Fuera de horario ({hour}h UTC) — no se abren nuevos trades")

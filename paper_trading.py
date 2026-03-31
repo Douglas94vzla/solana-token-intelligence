@@ -318,6 +318,9 @@ def calc_adaptive_stop(mint):
 
 def open_trade(mint, name, symbol, price, ml_prob, score, narrative, trade_size,
                strategy='STANDARD', liquidity_usd=None):
+    # Fallback: si symbol es None usar name o prefijo del mint
+    if not symbol:
+        symbol = name[:12] if name else mint[:8]
     slip        = dynamic_slippage(trade_size, liquidity_usd)   # mejora 13
     entry_price = float(price) * (1 + slip + FEES)
     strat_stop  = STRATEGIES.get(strategy, {}).get('stop_loss')

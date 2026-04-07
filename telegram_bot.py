@@ -118,3 +118,55 @@ def alert_system_status(status, message):
     emoji = "✅" if status == "OK" else "⚠️" if status == "WARN" else "🚨"
     msg = f"{emoji} <b>SISTEMA</b>: {message}"
     return send_message(msg)
+
+def alert_missed_summary(missed_rows):
+    """
+    Resumen de oportunidades perdidas del día anterior.
+    missed_rows: lista de (total, tracked, avg_pnl_1h, phantom_total,
+                            would_wins, best_pct, best_name, reason)
+    """
+    if not missed_rows:
+        return
+
+    total_missed   = sum(r[0] for r in missed_rows)
+    total_tracked  = sum(r[1] for r in missed_rows)
+    phantom_total  = sum(float(r[3] or 0) for r in missed_rows)
+    total_would_w  = sum(r[4] for r in missed_rows if r[4])
+
+    wr_phantom = (total_would_w / total_tracked * 100) if total_tracked > 0 else 0
+    emoji = "📈" if phantom_total > 0 else "📉"
+
+    lines = [
+        f"🔍 <b>OPORTUNIDADES PERDIDAS (ayer)</b>",
+        f"━━━━━━━━━━━━━━━━━━━━",
+        f"❌ Rechazados:   <b>{total_missed}</b>",
+        f"📊 Rastreados:   <b>{total_tracked}</b>",
+        f"{emoji} PnL fantasma: <b>${phantom_total:+.2f}</b> (ref $20/trade)",
+        f"🎯 WR fantasma:  <b>{wr_phantom:.0f}%</b>",
+        f"",
+        f"<b>Por razón de rechazo:</b>",
+    ]
+
+    REASON_LABELS = {
+        'ML_FILTER':          '🤖 ML bajo threshold',
+        'RUG_FILTER':         '🛡️  Rug alto',
+        'QUALITY_FILTER':     '🚫 Calidad',
+        'OUTSIDE_HOURS':      '🌙 Fuera de horario',
+        'ML_BELOW_STRATEGY':  '📊 ML bajo estrategia',
+        'MAX_OPEN':           '🔒 Max trades abiertos',
+    }
+
+    for r in missed_rows[:5]:   # top 5 razones
+        total_r, tracked_r, avg_r, phantom_r, would_w, best_pct, best_name, reason = r
+        label = REASON_LABELS.get(reason, reason)
+        avg_str = f"{float(avg_r):+.1f}%" if avg_r is not None else "N/A"
+        phantom_str = f"${float(phantom_r):+.2f}" if phantom_r is not None else "N/A"
+        best_str = f"{float(best_pct):+.1f}%" if best_pct is not None else "N/A"
+        lines.append(
+            f"  {label}: {total_r} | avg={avg_str} | {phantom_str}"
+        )
+        if best_name and best_pct is not None and float(best_pct) > 20:
+            lines.append(f"    ↳ mejor: <b>{best_name}</b> {best_str}")
+
+    lines.append(f"📅 {datetime.now().strftime('%Y-%m-%d')}")
+    return send_message("\n".join(lines))

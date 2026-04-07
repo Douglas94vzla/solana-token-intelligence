@@ -133,6 +133,37 @@ def setup_db():
             """, (strat, cfg['initial_capital'], cfg['initial_capital']))
         conn.commit()
         # Migraciones de columnas
+        # Tabla de missed trades (compartida con entry_signal.py — idempotente)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS missed_trades (
+                id               SERIAL PRIMARY KEY,
+                mint             TEXT NOT NULL,
+                name             TEXT,
+                symbol           TEXT,
+                ml_probability   NUMERIC(5,2),
+                rejection_stage  TEXT,
+                rejection_reason TEXT,
+                rejection_detail TEXT,
+                strategy         TEXT,
+                entry_price      NUMERIC(20,10),
+                missed_at        TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                price_30m        NUMERIC(20,10),
+                price_1h         NUMERIC(20,10),
+                price_2h         NUMERIC(20,10),
+                pnl_pct_30m      NUMERIC(10,2),
+                pnl_pct_1h       NUMERIC(10,2),
+                pnl_pct_2h       NUMERIC(10,2),
+                phantom_pnl_30m  NUMERIC(10,2),
+                phantom_pnl_1h   NUMERIC(10,2),
+                phantom_pnl_2h   NUMERIC(10,2),
+                tracked_30m      BOOLEAN DEFAULT FALSE,
+                tracked_1h       BOOLEAN DEFAULT FALSE,
+                tracked_2h       BOOLEAN DEFAULT FALSE
+            );
+            CREATE INDEX IF NOT EXISTS idx_missed_trades_mint ON missed_trades(mint);
+            CREATE INDEX IF NOT EXISTS idx_missed_trades_at   ON missed_trades(missed_at DESC);
+        """)
+        conn.commit()
         try:
             cur.execute("SET lock_timeout = '5s'")
             cur.execute("ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS peak_price NUMERIC(20,10)")
@@ -147,6 +178,32 @@ def setup_db():
         log.info("✅ Tablas paper trading creadas")
     finally:
         pool.putconn(conn)
+
+def log_missed_trade(mint, name, symbol, ml_prob, stage, reason, detail, price, strategy=None):
+    """Registra un trade rechazado para análisis post-mortem. Nunca lanza excepción."""
+    try:
+        conn = pool.getconn()
+        try:
+            cur = conn.cursor()
+            cur.execute("""
+                INSERT INTO missed_trades
+                    (mint, name, symbol, ml_probability, rejection_stage,
+                     rejection_reason, rejection_detail, strategy, entry_price)
+                SELECT %s, %s, %s, %s, %s, %s, %s, %s, %s
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM missed_trades
+                    WHERE mint = %s AND rejection_reason = %s
+                      AND (strategy = %s OR (%s IS NULL AND strategy IS NULL))
+                      AND missed_at > NOW() - INTERVAL '2 hours'
+                )
+            """, (mint, name, symbol, ml_prob, stage, reason, detail, strategy, price,
+                  mint, reason, strategy, strategy))
+            conn.commit()
+            cur.close()
+        finally:
+            pool.putconn(conn)
+    except Exception as e:
+        log.warning(f"log_missed_trade error: {e}")
 
 def get_capital():
     conn = pool.getconn()
@@ -508,11 +565,29 @@ def send_daily_summary():
             WHERE status = 'CLOSED'
         """)
         row = cur.fetchone()
-        cur.close()
         wins, losses, best_pct, worst_pct, day_pnl = row
         total = (wins or 0) + (losses or 0)
         win_rate = (wins / total * 100) if total > 0 else 0
         pnl_pct  = (float(cap['daily_pnl']) / INITIAL_CAPITAL) * 100
+
+        # ── MISSED TRADES DEL DÍA ───────────────────────
+        cur.execute("""
+            SELECT
+                COUNT(*)                                                   as total_missed,
+                COUNT(*) FILTER (WHERE tracked_1h)                         as tracked,
+                COALESCE(AVG(pnl_pct_1h) FILTER (WHERE tracked_1h), 0)    as avg_pnl_1h,
+                COALESCE(SUM(phantom_pnl_1h) FILTER (WHERE tracked_1h), 0) as phantom_total,
+                COUNT(*) FILTER (WHERE pnl_pct_1h > 0 AND tracked_1h)     as would_wins,
+                MAX(pnl_pct_1h) FILTER (WHERE tracked_1h)                  as best_missed_pct,
+                (ARRAY_AGG(name ORDER BY pnl_pct_1h DESC NULLS LAST))[1]  as best_missed_name,
+                rejection_reason
+            FROM missed_trades
+            WHERE DATE(missed_at) = CURRENT_DATE - 1
+            GROUP BY rejection_reason
+            ORDER BY SUM(phantom_pnl_1h) DESC NULLS LAST
+        """)
+        missed_rows = cur.fetchall()
+        cur.close()
 
         alert_daily_summary(
             capital   = cap['capital'],
@@ -522,6 +597,11 @@ def send_daily_summary():
             losses    = losses or 0,
             best_trade= f"{float(best_pct):+.1f}%"
         )
+
+        if missed_rows:
+            from telegram_bot import alert_missed_summary
+            alert_missed_summary(missed_rows)
+
         log.info(f"📊 Daily summary enviado | Capital: ${cap['capital']:.2f} | "
                  f"Win rate: {win_rate:.0f}% | P&L día: ${cap['daily_pnl']:+.2f}")
     finally:
@@ -816,9 +896,21 @@ def run():
                             if scfg['signal_source'] != 'standard':
                                 continue
                             if (ml_prob or 0) < scfg['ml_min']:
+                                log_missed_trade(
+                                    mint, name, symbol, ml_prob, 'PAPER_TRADING',
+                                    'ML_BELOW_STRATEGY',
+                                    f'ml={ml_prob}% < {scfg["ml_min"]}% ({strat_name})',
+                                    price, strategy=strat_name
+                                )
                                 continue
                             open_count = len(get_open_trades(strategy=strat_name))
                             if open_count >= scfg['max_open']:
+                                log_missed_trade(
+                                    mint, name, symbol, ml_prob, 'PAPER_TRADING',
+                                    'MAX_OPEN',
+                                    f'{strat_name}: {open_count}/{scfg["max_open"]} trades abiertos',
+                                    price, strategy=strat_name
+                                )
                                 continue
                             scap = get_strategy_capital(strat_name)
                             if not scap:
@@ -841,6 +933,17 @@ def run():
                 else:
                     hour = datetime.now(timezone.utc).hour
                     log.debug(f"🌙 Fuera de horario ({hour}h UTC) — no se abren nuevos trades")
+                    # Log missed trades durante horas fuera de ventana
+                    outside_signals = check_new_signals(ml_min=35)
+                    for sig in outside_signals:
+                        mint, name, symbol, price, ml_prob, score, narrative, liquidity = sig
+                        if price:
+                            log_missed_trade(
+                                mint, name, symbol, ml_prob, 'PAPER_TRADING',
+                                'OUTSIDE_HOURS',
+                                f'hora={hour}h UTC fuera de {TRADE_HOURS_UTC}',
+                                price, strategy='ALL'
+                            )
 
                 if now - last_summary >= SIGNAL_CHECK_INTERVAL:
                     last_summary = now

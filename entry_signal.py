@@ -55,6 +55,36 @@ def setup_db():
     try:
         cur = conn.cursor()
         cur.execute("""
+            CREATE TABLE IF NOT EXISTS missed_trades (
+                id               SERIAL PRIMARY KEY,
+                mint             TEXT NOT NULL,
+                name             TEXT,
+                symbol           TEXT,
+                ml_probability   NUMERIC(5,2),
+                rejection_stage  TEXT,
+                rejection_reason TEXT,
+                rejection_detail TEXT,
+                strategy         TEXT,
+                entry_price      NUMERIC(20,10),
+                missed_at        TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                price_30m        NUMERIC(20,10),
+                price_1h         NUMERIC(20,10),
+                price_2h         NUMERIC(20,10),
+                pnl_pct_30m      NUMERIC(10,2),
+                pnl_pct_1h       NUMERIC(10,2),
+                pnl_pct_2h       NUMERIC(10,2),
+                phantom_pnl_30m  NUMERIC(10,2),
+                phantom_pnl_1h   NUMERIC(10,2),
+                phantom_pnl_2h   NUMERIC(10,2),
+                tracked_30m      BOOLEAN DEFAULT FALSE,
+                tracked_1h       BOOLEAN DEFAULT FALSE,
+                tracked_2h       BOOLEAN DEFAULT FALSE
+            );
+            CREATE INDEX IF NOT EXISTS idx_missed_trades_mint ON missed_trades(mint);
+            CREATE INDEX IF NOT EXISTS idx_missed_trades_at   ON missed_trades(missed_at DESC);
+        """)
+        conn.commit()
+        cur.execute("""
             CREATE TABLE IF NOT EXISTS price_snapshots (
                 id SERIAL PRIMARY KEY,
                 mint TEXT REFERENCES discovered_tokens(mint),
@@ -88,6 +118,31 @@ def setup_db():
         log.info("✅ Tablas de señales creadas")
     finally:
         pool.putconn(conn)
+
+def log_missed_trade(mint, name, symbol, ml_prob, stage, reason, detail, price):
+    """Registra un trade que fue rechazado por algún filtro. Nunca lanza excepción."""
+    try:
+        conn = pool.getconn()
+        try:
+            cur = conn.cursor()
+            cur.execute("""
+                INSERT INTO missed_trades
+                    (mint, name, symbol, ml_probability, rejection_stage,
+                     rejection_reason, rejection_detail, entry_price)
+                SELECT %s, %s, %s, %s, %s, %s, %s, %s
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM missed_trades
+                    WHERE mint = %s AND rejection_reason = %s
+                      AND missed_at > NOW() - INTERVAL '2 hours'
+                )
+            """, (mint, name, symbol, ml_prob, stage, reason, detail, price,
+                  mint, reason))
+            conn.commit()
+            cur.close()
+        finally:
+            pool.putconn(conn)
+    except Exception as e:
+        log.warning(f"log_missed_trade error: {e}")
 
 async def fetch_current_data(session, mint):
     # Fuente 1: DexScreener (datos completos)
@@ -493,6 +548,9 @@ async def monitor_cycle():
                 # ── FILTRO RUG ────────────────────────────────
                 if signal == 'ENTER' and not is_rug_safe(mint):
                     log.info(f"🛡️  RUG BLOQUEADO | {name or mint[:8]} | rug_score alto")
+                    log_missed_trade(mint, name, symbol, None, 'ENTRY_SIGNAL',
+                                     'RUG_FILTER', f'rug_score >= {RUG_THRESHOLD}',
+                                     data["price_usd"])
                     signal = 'WAIT'
 
                 # ── FILTROS DE CALIDAD ────────────────────────
@@ -500,6 +558,8 @@ async def monitor_cycle():
                     blocked, reason = check_quality_filters(mint)
                     if blocked:
                         log.info(f"🚫 CALIDAD BLOQUEADO | {name or mint[:8]} | {reason}")
+                        log_missed_trade(mint, name, symbol, None, 'ENTRY_SIGNAL',
+                                         'QUALITY_FILTER', reason, data["price_usd"])
                         signal = 'WAIT'
 
                 # ── FILTRO ML ─────────────────────────────────
@@ -510,6 +570,10 @@ async def monitor_cycle():
                         f"🤖 ML BLOQUEADO | {name or mint[:8]} | "
                         f"prob={ml_prob}% < {ML_THRESHOLD*100:.0f}%"
                     )
+                    log_missed_trade(mint, name, symbol, ml_prob, 'ENTRY_SIGNAL',
+                                     'ML_FILTER',
+                                     f'ml={ml_prob}% < {ML_THRESHOLD*100:.0f}%',
+                                     data["price_usd"])
                     signal = 'WATCH'
 
                 update_entry_signal(mint, signal, data["price_usd"], ml_prob)

@@ -33,8 +33,8 @@ pool = psycopg2.pool.ThreadedConnectionPool(
 INITIAL_CAPITAL       = 1000.0   # Capital simulado
 TRADE_SIZE_PCT        = 0.02     # 2% por trade
 MAX_OPEN_TRADES       = 3        # Máximo trades simultáneos
-TAKE_PROFIT           = 1.50     # +50% TP final (50% restante)
-PARTIAL_TP_PCT        = 1.20     # +20% → cierra 50% de la posición y activa trailing
+TAKE_PROFIT           = 1.80     # +80% TP final (50% restante) — subido de 1.50 el 2026-04-10
+PARTIAL_TP_PCT        = 1.30     # +30% → cierra 50% de la posición — subido de 1.20 el 2026-04-10
 STOP_LOSS             = 0.70     # -30% stop inicial fijo
 TRAIL_PCT             = 0.20     # Trailing: cierra si cae 20% desde el pico
 TRAIL_ACTIVATE        = 0.10     # Trailing activa solo si el trade subió 10%+
@@ -59,14 +59,14 @@ EMERGENCY_EXIT_MINUTES    = 5    # Solo aplica si el trade tiene menos de 5 min 
 #                'early'    → usa check_early_entry_signals() (sin filtros de social/liquidez)
 STRATEGIES = {
     'CONSERVATIVE': {
-        'ml_min':          50,
+        'ml_min':          80,   # subido de 50 el 2026-04-10 — análisis 106 trades
         'max_open':         2,
         'size_pct':        0.01,
         'initial_capital': 333.0,
         'signal_source':   'standard',
     },
     'STANDARD': {
-        'ml_min':          35,
+        'ml_min':          80,   # subido de 35 el 2026-04-10 — ML 65-79% WR 50% PnL negativo
         'max_open':         3,
         'size_pct':        None,    # Usa Kelly sizing
         'initial_capital': 333.0,
@@ -757,9 +757,10 @@ def manage_open_trades():
             peak = current_price
             update_peak_price(tid, peak)
 
-        # ── PARTIAL TAKE PROFIT (+20%: cerrar 50%) ─────────
-        # Al llegar a +20%, aseguramos la mitad de la posición y
-        # activamos trailing stop inmediato en el 50% restante.
+        # ── PARTIAL TAKE PROFIT (+30%: cerrar 50%) ─────────
+        # Al llegar a +30%, aseguramos la mitad de la posición.
+        # El 50% restante sigue hasta TAKE_PROFIT (+80%), STOP_LOSS o TIMEOUT.
+        # (trailing stop desactivado 2026-04-10 — análisis 106 trades)
         if not partial_tp_taken and current_price >= entry * PARTIAL_TP_PCT:
             half_size = float(trade_size) / 2.0
             exit_price_partial = current_price * (1 - FEES)
@@ -802,20 +803,11 @@ def manage_open_trades():
             )
             _apply_pnl_to_cap(strategy, pnl, trade_size, pnl > 0)
 
-        # ── TRAILING STOP ───────────────────────────────────
-        # Activa si: partial TP ya tomado (estamos en ganancia garantizada),
-        # O si el trade subió TRAIL_ACTIVATE%+ desde la entrada.
-        elif ((partial_tp_taken or peak >= entry * (1 + TRAIL_ACTIVATE)) and
-              current_price <= peak * (1 - TRAIL_PCT)):
-            trail_level  = peak * (1 - TRAIL_PCT)
-            gain_at_peak = (peak - entry) / entry * 100
-            log.info(f"🔔 TRAILING STOP #{tid} [{strategy}] | Peak: +{gain_at_peak:.1f}% | "
-                     f"Trail: ${trail_level:.8f}")
-            pnl, pnl_pct = close_trade(
-                tid, mint, name, entry_price,
-                float(trade_size), current_price, "TRAILING_STOP", strategy
-            )
-            _apply_pnl_to_cap(strategy, pnl, trade_size, pnl > 0)
+        # ── TRAILING STOP — DESACTIVADO 2026-04-10 ──────────
+        # Análisis estadístico 106 trades (31/03–10/04):
+        # 38 trailing stops, WR 18.4%, pérdida total $55 — destruía el sistema
+        # por volatilidad natural de Pump.fun (falsos cierres en rebotes).
+        # Salidas activas: TAKE_PROFIT, STOP_LOSS, TIMEOUT, EMERGENCY_EXIT.
 
         # ── EMERGENCY EXIT (<5min, precio cae >50%) ──────────
         # En rugs ultrarrápidos el precio cruza el stop de -30% en un solo ciclo de 10s
@@ -887,7 +879,7 @@ def run():
                 last_signal_check = now
                 if is_trading_hours():
                     # ── Estrategias standard (requieren entry_signal='ENTER') ──
-                    signals = check_new_signals(ml_min=35)
+                    signals = check_new_signals(ml_min=80)
                     for sig in signals:
                         mint, name, symbol, price, ml_prob, score, narrative, liquidity = sig
                         if not price:
@@ -934,7 +926,7 @@ def run():
                     hour = datetime.now(timezone.utc).hour
                     log.debug(f"🌙 Fuera de horario ({hour}h UTC) — no se abren nuevos trades")
                     # Log missed trades durante horas fuera de ventana
-                    outside_signals = check_new_signals(ml_min=35)
+                    outside_signals = check_new_signals(ml_min=80)
                     for sig in outside_signals:
                         mint, name, symbol, price, ml_prob, score, narrative, liquidity = sig
                         if price:

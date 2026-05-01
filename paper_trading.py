@@ -3,11 +3,14 @@ import psycopg2.pool
 import os
 import time
 import logging
+import math
+import statistics
 import requests
 from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
 from telegram_bot import (alert_paper_trade, alert_daily_summary,
-                           alert_system_status, send_message)
+                           alert_system_status, send_message,
+                           alert_consecutive_losses, alert_no_ml_samples)
 
 load_dotenv('/root/solana_bot/.env')
 
@@ -42,15 +45,26 @@ MAX_HOLD_MINUTES      = 30       # Timeout 30 minutos (tokens que no despegan en
 DAILY_LOSS_LIMIT      = 0.03     # Parar si perdemos 3% en el día
 SLIPPAGE              = 0.03     # Slippage base (fallback si no hay liquidez)
 FEES                  = 0.005    # 0.5% fees
-TRADE_HOURS_UTC       = (13, 23) # Solo abrir trades entre 13h y 23h UTC
+TRADE_HOURS_UTC_WINDOWS = [(13, 18), (22, 24)]  # 13–17h y 22–23h UTC (evita 18–21h: WR 35–41%)
 POSITION_CHECK_INTERVAL = 10     # Revisar posiciones abiertas cada 10s
 SIGNAL_CHECK_INTERVAL   = 60     # Buscar señales nuevas cada 60s
 STOP_LOSS_MIN         = 0.85     # Stop adaptativo mínimo: -15%
 STOP_LOSS_MAX         = 0.70     # Stop adaptativo máximo: -30%
 TRAILING_REENTRY_COOLDOWN = 15   # Minutos de espera antes de re-entrada tras trailing stop
+BLOCKED_NARRATIVES = ('AI/AGI', 'IDENTITY', 'NUMBERS')  # WR < 40% histórico — destruyen capital
 EARLY_TOKEN_MAX_MINUTES   = 15   # EARLY_ENTRY: máxima edad del token en minutos
 EMERGENCY_EXIT_PCT        = 0.50 # Emergency exit: salir si precio cae >50% desde entry
 EMERGENCY_EXIT_MINUTES    = 5    # Solo aplica si el trade tiene menos de 5 min de vida
+EXTENDED_TP_BOOST         = 0.20 # Extensión de TP si momentum fuerte: TAKE_PROFIT + 20%
+
+# ── VOLATILITY TARGETING (paso 6) ─────────────────────
+VOL_TARGET = 0.25   # 25% volatilidad objetivo (decimal)
+VOL_WINDOW = 20     # últimos N trades cerrados para medir vol
+
+# ── CROSS-ASSET FILTER (paso 8) ────────────────────────
+SOL_DROP_THRESHOLD = -5.0   # pausar si SOL cae >5% en 1h
+BTC_DROP_THRESHOLD = -3.0   # pausar si BTC cae >3% en 1h
+MACRO_CACHE_TTL    = 300    # refrescar precios macro cada 5 min
 
 # ── MULTI-STRATEGY CONFIG (mejora 14) ─────────────────
 # Cada estrategia corre en paralelo con su propio capital virtual.
@@ -171,6 +185,11 @@ def setup_db():
             cur.execute("ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS strategy TEXT DEFAULT 'STANDARD'")
             cur.execute("ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS slippage_pct NUMERIC(6,4)")
             cur.execute("ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS partial_tp_taken BOOLEAN DEFAULT FALSE")
+            cur.execute("ALTER TABLE strategy_capital ADD COLUMN IF NOT EXISTS peak_capital NUMERIC(20,2)")
+            cur.execute("""
+                UPDATE strategy_capital SET peak_capital = GREATEST(initial_capital, capital)
+                WHERE peak_capital IS NULL
+            """)
             conn.commit()
         except Exception:
             conn.rollback()
@@ -313,7 +332,8 @@ def get_strategy_capital(strategy):
     try:
         cur = conn.cursor()
         cur.execute("""
-            SELECT capital, initial_capital, wins, losses, total_pnl
+            SELECT capital, initial_capital, wins, losses, total_pnl,
+                   COALESCE(peak_capital, initial_capital) as peak_capital
             FROM strategy_capital WHERE strategy = %s
         """, (strategy,))
         row = cur.fetchone()
@@ -326,6 +346,7 @@ def get_strategy_capital(strategy):
             'wins':            row[2],
             'losses':          row[3],
             'total_pnl':       float(row[4]),
+            'peak_capital':    float(row[5]),
         }
     finally:
         pool.putconn(conn)
@@ -336,14 +357,210 @@ def update_strategy_capital(strategy, capital, wins, losses, total_pnl):
         cur = conn.cursor()
         cur.execute("""
             UPDATE strategy_capital SET
-                capital = %s, wins = %s, losses = %s,
-                total_pnl = %s, updated_at = NOW()
+                capital      = %s,
+                wins         = %s,
+                losses       = %s,
+                total_pnl    = %s,
+                updated_at   = NOW(),
+                peak_capital = GREATEST(COALESCE(peak_capital, initial_capital), %s)
             WHERE strategy = %s
-        """, (capital, wins, losses, total_pnl, strategy))
+        """, (capital, wins, losses, total_pnl, capital, strategy))
         conn.commit()
         cur.close()
     finally:
         pool.putconn(conn)
+
+# Throttle: una alerta por estrategia cada hora para drawdown >15%
+_dd_alerted: dict[str, float] = {}
+
+def get_drawdown_factor(strategy: str) -> float:
+    """
+    Factor de sizing basado en drawdown desde el pico histórico de capital.
+    < 5%  → 1.00 (sin cambio)
+    5-10% → 0.75
+    10-15%→ 0.50
+    > 15% → 0.00 (pausa + alerta Telegram, máx 1 alerta/hora)
+    """
+    scap = get_strategy_capital(strategy)
+    if not scap:
+        return 1.0
+    peak    = scap['peak_capital']
+    current = scap['capital']
+    if peak <= 0:
+        return 1.0
+    drawdown = (peak - current) / peak
+    if drawdown < 0.05:
+        return 1.0
+    if drawdown < 0.10:
+        log.info(f"📉 [{strategy}] Drawdown {drawdown*100:.1f}% — sizing ×0.75")
+        return 0.75
+    if drawdown < 0.15:
+        log.warning(f"📉 [{strategy}] Drawdown {drawdown*100:.1f}% — sizing ×0.50")
+        return 0.50
+    # > 15%: pausa total
+    now_ts = time.monotonic()
+    if now_ts - _dd_alerted.get(strategy, 0) > 3600:
+        _dd_alerted[strategy] = now_ts
+        send_message(
+            f"🚨 DRAWDOWN CRÍTICO [{strategy}] | "
+            f"{drawdown*100:.1f}% desde pico ${peak:.2f} → ${current:.2f} | "
+            f"⛔ Pausando nuevas entradas"
+        )
+        log.error(f"🚨 [{strategy}] Drawdown {drawdown*100:.1f}% > 15% — PAUSANDO")
+    return 0.0
+
+
+_macro_cache: dict = {'sol': None, 'btc': None, 'fetched_at': 0.0}
+_macro_alerted_at: float = 0.0
+
+def get_macro_risk() -> tuple:
+    """
+    Consulta el cambio de precio de SOL y BTC en la última hora vía CoinGecko.
+    Resultado cacheado MACRO_CACHE_TTL segundos para no saturar la API.
+    Retorna (is_risk_off: bool, motivo: str).
+    Falla silenciosa si la API no responde — nunca bloquea por error externo.
+    """
+    global _macro_cache, _macro_alerted_at
+    now_ts = time.monotonic()
+
+    if now_ts - _macro_cache['fetched_at'] >= MACRO_CACHE_TTL:
+        try:
+            url  = ("https://api.coingecko.com/api/v3/coins/markets"
+                    "?vs_currency=usd&ids=solana,bitcoin&price_change_percentage=1h")
+            resp = requests.get(url, timeout=10)
+            resp.raise_for_status()
+            sol_ch = btc_ch = None
+            for coin in resp.json():
+                ch = coin.get('price_change_percentage_1h_in_currency')
+                if coin['id'] == 'solana':
+                    sol_ch = ch
+                elif coin['id'] == 'bitcoin':
+                    btc_ch = ch
+            _macro_cache = {'sol': sol_ch, 'btc': btc_ch, 'fetched_at': now_ts}
+            log.debug(f"🌍 Macro: SOL {sol_ch:+.2f}% | BTC {btc_ch:+.2f}% (1h)")
+        except Exception as e:
+            log.debug(f"get_macro_risk error: {e}")
+            return False, ""   # falla silenciosa → no bloquear por API caída
+
+    sol_ch = _macro_cache['sol']
+    btc_ch = _macro_cache['btc']
+
+    if sol_ch is not None and sol_ch < SOL_DROP_THRESHOLD:
+        motivo = f"SOL {sol_ch:+.1f}% en 1h"
+    elif btc_ch is not None and btc_ch < BTC_DROP_THRESHOLD:
+        motivo = f"BTC {btc_ch:+.1f}% en 1h"
+    else:
+        return False, ""
+
+    # Alerta Telegram throttled a 1 vez/hora
+    if now_ts - _macro_alerted_at > 3600:
+        _macro_alerted_at = now_ts
+        send_message(f"🌍 MACRO RISK-OFF | {motivo} | ⛔ Pausando nuevas entradas")
+        log.warning(f"🌍 MACRO RISK-OFF: {motivo}")
+
+    return True, motivo
+
+
+def get_vol_adjusted_size(base_size: float, strategy: str) -> tuple:
+    """
+    Escala el tamaño de la posición según la volatilidad reciente de los trades.
+    vol_actual = std(pnl_pct de los últimos VOL_WINDOW trades cerrados)
+    size_factor = min(1.0, VOL_TARGET / vol_actual)
+    Con < 5 trades o mercado muy tranquilo devuelve factor 1.0 sin tocar base_size.
+    """
+    conn = pool.getconn()
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT pnl_pct FROM paper_trades
+            WHERE status = 'CLOSED'
+              AND COALESCE(strategy, 'STANDARD') = %s
+              AND pnl_pct IS NOT NULL
+            ORDER BY closed_at DESC
+            LIMIT %s
+        """, (strategy, VOL_WINDOW))
+        rows = cur.fetchall()
+        cur.close()
+    finally:
+        pool.putconn(conn)
+
+    if len(rows) < 5:
+        return base_size, 1.0
+
+    # pnl_pct en DB está en % (ej. 30.5) → convertir a decimal para comparar con VOL_TARGET
+    pnl_pcts = [float(r[0]) / 100.0 for r in rows]
+    vol_actual = statistics.stdev(pnl_pcts)
+
+    if vol_actual < 0.01:   # mercado casi sin varianza → no escalar
+        return base_size, 1.0
+
+    vol_factor = min(1.0, VOL_TARGET / vol_actual)
+    adjusted   = round(base_size * vol_factor, 2)
+    return adjusted, round(vol_factor, 3)
+
+
+def has_concentration_risk(mint: str, strategy: str) -> tuple:
+    """
+    Devuelve (True, motivo) si abrir este token violaría límites de concentración:
+    - Mismo deployer que un trade abierto → riesgo correlacionado
+    - 2+ trades abiertos del mismo narrative en la misma estrategia
+    """
+    conn = pool.getconn()
+    try:
+        cur = conn.cursor()
+        # Check deployer duplicado
+        cur.execute("""
+            SELECT COUNT(*) FROM paper_trades pt
+            JOIN discovered_tokens dt  ON dt.mint  = pt.mint
+            JOIN discovered_tokens dt2 ON dt2.mint = %s
+            WHERE pt.status = 'OPEN'
+              AND dt.deployer_wallet IS NOT NULL
+              AND dt.deployer_wallet != ''
+              AND dt.deployer_wallet = dt2.deployer_wallet
+        """, (mint,))
+        if cur.fetchone()[0] > 0:
+            cur.close()
+            return True, "mismo_deployer"
+
+        # Check saturación de narrative (máx 2 por estrategia)
+        cur.execute("""
+            SELECT COUNT(*) FROM paper_trades pt
+            JOIN discovered_tokens dt  ON dt.mint  = pt.mint
+            JOIN discovered_tokens dt2 ON dt2.mint = %s
+            WHERE pt.status = 'OPEN'
+              AND COALESCE(pt.strategy, 'STANDARD') = %s
+              AND dt2.narrative IS NOT NULL
+              AND dt2.narrative != 'OTHER'
+              AND dt.narrative = dt2.narrative
+        """, (mint, strategy))
+        if cur.fetchone()[0] >= 2:
+            cur.close()
+            return True, "mismo_narrative_x2"
+
+        cur.close()
+        return False, None
+    finally:
+        pool.putconn(conn)
+
+
+def should_extend_tp(mint: str) -> bool:
+    """True si el momentum actual justifica extender el TP: BSR > 3 y buys_5m > 20."""
+    conn = pool.getconn()
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT buys_5m, sells_5m FROM discovered_tokens WHERE mint = %s
+        """, (mint,))
+        row = cur.fetchone()
+        cur.close()
+    finally:
+        pool.putconn(conn)
+    if not row:
+        return False
+    buys_5m, sells_5m = row
+    bsr = (buys_5m or 0) / ((sells_5m or 0) + 1)
+    return bsr > 3.0 and (buys_5m or 0) > 20
+
 
 def calc_adaptive_stop(mint):
     """
@@ -488,6 +705,7 @@ def check_new_signals(ml_min=65):
               )
               AND (dt.rug_flags IS NULL OR dt.rug_flags NOT LIKE '%%NEAR_ZERO_LIQUIDITY%%')
               AND (dt.price_change_1h IS NULL OR dt.price_change_1h > -70)
+              AND (dt.narrative IS NULL OR dt.narrative NOT IN ('AI/AGI', 'IDENTITY', 'NUMBERS'))
               AND dt.mint NOT IN (
                   SELECT mint FROM paper_trades
                   WHERE status = 'OPEN'
@@ -544,9 +762,14 @@ def is_daily_limit_hit():
     return cap['daily_pnl'] / INITIAL_CAPITAL < -DAILY_LOSS_LIMIT
 
 def is_trading_hours():
-    """Solo abrir trades en horario de mayor actividad (13h–23h UTC)"""
-    hour = datetime.now(timezone.utc).hour
-    return TRADE_HOURS_UTC[0] <= hour <= TRADE_HOURS_UTC[1]
+    """Solo abrir trades en ventanas de mayor win rate histórico.
+    Excluye: sábados (WR 41%), horas 18–21h UTC (WR 35–41%).
+    """
+    now_utc = datetime.now(timezone.utc)
+    if now_utc.weekday() == 5:  # 5 = sábado
+        return False
+    hour = now_utc.hour
+    return any(start <= hour < end for start, end in TRADE_HOURS_UTC_WINDOWS)
 
 def send_daily_summary():
     """Envía resumen diario por Telegram con métricas del día."""
@@ -635,6 +858,87 @@ def sync_paper_capital():
     finally:
         pool.putconn(conn)
 
+def rebalance_strategy_capital():
+    """
+    Redistribuye el capital total entre estrategias según su Sharpe ratio de los últimos 7 días.
+    sharpe_7d = mean(daily_ret) / std(daily_ret) * sqrt(7)
+    Pesos = softmax(sharpe_scores). Floor del 10% por estrategia.
+    """
+    if len(STRATEGIES) < 2:
+        return
+
+    conn = pool.getconn()
+    try:
+        cur = conn.cursor()
+        scaps         = {}
+        sharpe_scores = {}
+        for strat_name in STRATEGIES:
+            scap = get_strategy_capital(strat_name)
+            scaps[strat_name] = scap
+            if not scap:
+                sharpe_scores[strat_name] = 0.0
+                continue
+            cur.execute("""
+                SELECT DATE(closed_at), SUM(pnl)
+                FROM paper_trades
+                WHERE status = 'CLOSED'
+                  AND COALESCE(strategy, 'STANDARD') = %s
+                  AND closed_at >= NOW() - INTERVAL '7 days'
+                  AND pnl IS NOT NULL
+                GROUP BY DATE(closed_at)
+                ORDER BY 1
+            """, (strat_name,))
+            rows = cur.fetchall()
+            if len(rows) < 3:
+                # Datos insuficientes → Sharpe neutro (no penalizar ni premiar)
+                sharpe_scores[strat_name] = 0.0
+                continue
+            daily_rets = [float(r[1]) / max(scap['initial_capital'], 1) for r in rows]
+            mean_r = statistics.mean(daily_rets)
+            std_r  = statistics.stdev(daily_rets) if len(daily_rets) > 1 else 0.0
+            sharpe_scores[strat_name] = (
+                mean_r / std_r * math.sqrt(7) if std_r > 1e-6
+                else mean_r * math.sqrt(7)
+            )
+        cur.close()
+    finally:
+        pool.putconn(conn)
+
+    strat_names   = list(STRATEGIES.keys())
+    scores        = [sharpe_scores[s] for s in strat_names]
+    total_capital = sum(scaps[s]['capital'] for s in strat_names if scaps.get(s))
+
+    if total_capital <= 0:
+        return
+
+    # Softmax con shift numérico para evitar overflow
+    max_s      = max(scores)
+    exp_scores = [math.exp(s - max_s) for s in scores]
+    total_exp  = sum(exp_scores)
+    weights    = [e / total_exp for e in exp_scores]
+
+    min_alloc = total_capital * 0.10   # floor: ninguna estrategia cae por debajo del 10%
+
+    log.info(f"📊 REBALANCEO SEMANAL | Capital total: ${total_capital:.2f}")
+    lines = [f"📊 Rebalanceo semanal | Total: ${total_capital:.2f}"]
+    for strat, weight, sharpe in zip(strat_names, weights, scores):
+        scap = scaps.get(strat)
+        if not scap:
+            continue
+        old_cap = scap['capital']
+        new_cap = max(min_alloc, total_capital * weight)
+        update_strategy_capital(strat, new_cap, scap['wins'], scap['losses'], scap['total_pnl'])
+        arrow = "↑" if new_cap > old_cap + 0.01 else ("↓" if new_cap < old_cap - 0.01 else "=")
+        log.info(f"  [{strat}] Sharpe7d={sharpe:+.2f} | peso={weight*100:.1f}% | "
+                 f"${old_cap:.2f} {arrow} ${new_cap:.2f}")
+        lines.append(f"  {strat}: Sharpe={sharpe:+.2f} | {weight*100:.0f}% | "
+                     f"${old_cap:.0f}{arrow}${new_cap:.0f}")
+
+    sync_paper_capital()
+    send_message("\n".join(lines))
+    log.info("✅ Rebalanceo completado")
+
+
 def print_summary():
     cap = get_capital()
     conn = pool.getconn()
@@ -720,6 +1024,8 @@ def _apply_partial_pnl(strategy, pnl, half_size):
 
 # Contador de ciclos sin precio por trade_id (en memoria)
 _no_price_count: dict[int, int] = {}
+# Trades con TP extendido por momentum fuerte (en memoria)
+_tp_extended: set = set()
 # Máx ciclos sin precio antes de cerrar al stop máximo (6 × 10s = 60s)
 NO_PRICE_LIMIT = 6
 
@@ -795,24 +1101,33 @@ def manage_open_trades():
             partial_tp_taken = True
             trade_size = half_size
 
-        # ── TAKE PROFIT (50% restante, o 100% si no hubo partial) ──
-        if current_price >= entry * TAKE_PROFIT:
+        # ── EXTENDED TAKE PROFIT (momentum extendió el TP previamente) ──
+        ext_tp_level = TAKE_PROFIT + EXTENDED_TP_BOOST
+        if tid in _tp_extended and current_price >= entry * ext_tp_level:
             pnl, pnl_pct = close_trade(
                 tid, mint, name, entry_price,
-                float(trade_size), current_price, "TAKE_PROFIT", strategy
+                float(trade_size), current_price, "TAKE_PROFIT_EXT", strategy
             )
             _apply_pnl_to_cap(strategy, pnl, trade_size, pnl > 0)
+            _tp_extended.discard(tid)
 
-        # ── TRAILING STOP — DESACTIVADO 2026-04-10 ──────────
-        # Análisis estadístico 106 trades (31/03–10/04):
-        # 38 trailing stops, WR 18.4%, pérdida total $55 — destruía el sistema
-        # por volatilidad natural de Pump.fun (falsos cierres en rebotes).
-        # Salidas activas: TAKE_PROFIT, STOP_LOSS, TIMEOUT, EMERGENCY_EXIT.
+        # ── TAKE PROFIT base ────────────────────────────────
+        elif current_price >= entry * TAKE_PROFIT:
+            if tid not in _tp_extended and should_extend_tp(mint):
+                # Momentum fuerte → extender TP una vez
+                _tp_extended.add(tid)
+                log.info(f"🚀 TP EXTENDIDO #{tid} [{strategy}] | {name or mint[:8]} | "
+                         f"BSR>3 | nuevo TP +{(ext_tp_level-1)*100:.0f}%")
+            elif tid not in _tp_extended:
+                # Momentum débil → cerrar al TP normal
+                pnl, pnl_pct = close_trade(
+                    tid, mint, name, entry_price,
+                    float(trade_size), current_price, "TAKE_PROFIT", strategy
+                )
+                _apply_pnl_to_cap(strategy, pnl, trade_size, pnl > 0)
+            # else: en modo extendido, esperando ext_tp_level — no hacer nada
 
         # ── EMERGENCY EXIT (<5min, precio cae >50%) ──────────
-        # En rugs ultrarrápidos el precio cruza el stop de -30% en un solo ciclo de 10s
-        # y close_trade registraría -95%+. Simulamos salida al límite de -50% asumiendo
-        # que una orden límite habría ejecutado antes del fondo.
         elif (age_minutes < EMERGENCY_EXIT_MINUTES and
               current_price < entry * EMERGENCY_EXIT_PCT):
             sim_exit = entry * EMERGENCY_EXIT_PCT
@@ -824,6 +1139,7 @@ def manage_open_trades():
                 float(trade_size), sim_exit, "EMERGENCY_EXIT", strategy
             )
             _apply_pnl_to_cap(strategy, pnl, trade_size, False)
+            _tp_extended.discard(tid)
 
         # ── STOP LOSS ADAPTATIVO ────────────────────────────
         elif current_price <= entry * float(stop_loss_pct):
@@ -832,6 +1148,7 @@ def manage_open_trades():
                 float(trade_size), current_price, "STOP_LOSS", strategy
             )
             _apply_pnl_to_cap(strategy, pnl, trade_size, False)
+            _tp_extended.discard(tid)
 
         # ── TIMEOUT ─────────────────────────────────────────
         elif (datetime.now() - opened_at.replace(tzinfo=None) >
@@ -841,6 +1158,78 @@ def manage_open_trades():
                 float(trade_size), current_price, "TIMEOUT", strategy
             )
             _apply_pnl_to_cap(strategy, pnl, trade_size, pnl > 0)
+            _tp_extended.discard(tid)
+
+
+_monitoring_alerted: dict = {}   # throttle por tipo de alerta
+
+def _check_monitoring():
+    """
+    Checks periódicos de salud del sistema. Llamado cada hora desde run().
+    - 5 trades consecutivos perdedores por estrategia → alerta
+    - Sin muestras ML limpias en 6h → alerta
+    - Drawdown 10-15% → alerta amarilla (>15% ya cubierto en get_drawdown_factor)
+    """
+    now_ts = time.monotonic()
+
+    # ── Racha perdedora ────────────────────────────────
+    conn = pool.getconn()
+    try:
+        cur = conn.cursor()
+        for strat_name in STRATEGIES:
+            cur.execute("""
+                SELECT pnl > 0 FROM paper_trades
+                WHERE status = 'CLOSED'
+                  AND COALESCE(strategy, 'STANDARD') = %s
+                ORDER BY closed_at DESC LIMIT 5
+            """, (strat_name,))
+            results = [r[0] for r in cur.fetchall()]
+            if len(results) == 5 and not any(results):
+                key = f"loss_streak_{strat_name}"
+                if now_ts - _monitoring_alerted.get(key, 0) > 3600:
+                    _monitoring_alerted[key] = now_ts
+                    alert_consecutive_losses(5, strat_name)
+                    log.warning(f"🔴 [{strat_name}] 5 trades consecutivos en pérdida")
+
+        # ── Sin muestras ML limpias ────────────────────
+        cur.execute("""
+            SELECT EXTRACT(EPOCH FROM (NOW() - MAX(captured_at))) / 3600
+            FROM token_features_at_signal
+        """)
+        row = cur.fetchone()
+        if row and row[0] is not None:
+            hours_since = float(row[0])
+            if hours_since > 6.0:
+                key = "no_ml_samples"
+                if now_ts - _monitoring_alerted.get(key, 0) > 3600:
+                    _monitoring_alerted[key] = now_ts
+                    alert_no_ml_samples(hours_since)
+                    log.warning(f"⚠️  Sin muestras ML: {hours_since:.1f}h")
+
+        # ── Drawdown amarillo (10-15%) ─────────────────
+        for strat_name in STRATEGIES:
+            scap = get_strategy_capital(strat_name)
+            if not scap:
+                continue
+            peak = scap['peak_capital']
+            if peak <= 0:
+                continue
+            dd = (peak - scap['capital']) / peak
+            if 0.10 <= dd < 0.15:
+                key = f"dd_yellow_{strat_name}"
+                if now_ts - _monitoring_alerted.get(key, 0) > 3600:
+                    _monitoring_alerted[key] = now_ts
+                    send_message(
+                        f"⚠️ DRAWDOWN AMARILLO [{strat_name}] | "
+                        f"{dd*100:.1f}% desde pico ${peak:.2f} → ${scap['capital']:.2f}"
+                    )
+                    log.warning(f"⚠️  [{strat_name}] Drawdown amarillo: {dd*100:.1f}%")
+
+        cur.close()
+    except Exception as e:
+        log.warning(f"_check_monitoring error: {e}")
+    finally:
+        pool.putconn(conn)
 
 
 def run():
@@ -851,18 +1240,31 @@ def run():
     alert_system_status("OK", "Paper Trading Engine iniciado")
 
     last_daily_reset  = datetime.now().date()
-    last_signal_check = 0.0   # timestamp de la última búsqueda de señales
+    last_signal_check = 0.0
     last_summary      = 0.0
+    last_rebalance    = datetime.now().date()
+    last_monitoring   = 0.0   # check horario de salud del sistema
 
     while True:
         try:
             now = time.monotonic()
 
             # ── RESET DIARIO ───────────────────────────────
-            if datetime.now().date() > last_daily_reset:
+            today = datetime.now().date()
+            if today > last_daily_reset:
                 send_daily_summary()
                 reset_daily_pnl()
-                last_daily_reset = datetime.now().date()
+                last_daily_reset = today
+
+            # ── REBALANCEO SEMANAL ──────────────────────────
+            if (datetime.now().date() - last_rebalance).days >= 7:
+                rebalance_strategy_capital()
+                last_rebalance = datetime.now().date()
+
+            # ── MONITORING HORARIO ──────────────────────────
+            if now - last_monitoring >= 3600:
+                last_monitoring = now
+                _check_monitoring()
 
             # ── GESTIONAR POSICIONES ABIERTAS (cada 10s) ───
             # SIEMPRE gestionar posiciones abiertas, incluso con límite diario activo
@@ -878,6 +1280,12 @@ def run():
             if now - last_signal_check >= SIGNAL_CHECK_INTERVAL:
                 last_signal_check = now
                 if is_trading_hours():
+                    # ── FILTRO MACRO: pausar si SOL/BTC cae bruscamente ──────
+                    macro_off, macro_reason = get_macro_risk()
+                    if macro_off:
+                        log.warning(f"🌍 MACRO RISK-OFF ({macro_reason}) — ciclo saltado")
+                        continue
+
                     # ── Estrategias standard (requieren entry_signal='ENTER') ──
                     signals = check_new_signals(ml_min=80)
                     for sig in signals:
@@ -907,12 +1315,34 @@ def run():
                             scap = get_strategy_capital(strat_name)
                             if not scap:
                                 continue
+                            dd_factor = get_drawdown_factor(strat_name)
+                            if dd_factor == 0.0:
+                                log_missed_trade(
+                                    mint, name, symbol, ml_prob, 'PAPER_TRADING',
+                                    'DRAWDOWN_PAUSE',
+                                    f'{strat_name}: drawdown >15% — entradas pausadas',
+                                    price, strategy=strat_name
+                                )
+                                continue
+                            conc_risk, conc_reason = has_concentration_risk(mint, strat_name)
+                            if conc_risk:
+                                log_missed_trade(
+                                    mint, name, symbol, ml_prob, 'PAPER_TRADING',
+                                    'CONCENTRATION_RISK', conc_reason,
+                                    price, strategy=strat_name
+                                )
+                                log.info(f"🚫 [{strat_name}] CONCENTRATION_RISK: {conc_reason} — {name or mint[:8]}")
+                                continue
                             if scfg['size_pct'] is None:
                                 t_size, size_pct = kelly_size(ml_prob or 65, scap['capital'])
-                                log.info(f"💰 [{strat_name}] Kelly: {size_pct:.1f}% = ${t_size:.2f} | ML={ml_prob}%")
+                                t_size = round(t_size * dd_factor, 2)
+                                base_label = f"Kelly {size_pct:.1f}%"
                             else:
-                                t_size = round(scap['capital'] * scfg['size_pct'], 2)
-                                log.info(f"💰 [{strat_name}] Fixed: {scfg['size_pct']*100:.0f}% = ${t_size:.2f} | ML={ml_prob}%")
+                                t_size = round(scap['capital'] * scfg['size_pct'] * dd_factor, 2)
+                                base_label = f"Fixed {scfg['size_pct']*100:.0f}%"
+                            t_size, vol_factor = get_vol_adjusted_size(t_size, strat_name)
+                            vol_tag = f" × VOL{vol_factor}" if vol_factor < 1.0 else ""
+                            log.info(f"💰 [{strat_name}] {base_label} × DD{dd_factor}{vol_tag} = ${t_size:.2f} | ML={ml_prob}%")
                             open_trade(mint, name, symbol, price,
                                        ml_prob, score, narrative, t_size,
                                        strategy=strat_name, liquidity_usd=liquidity)
@@ -933,7 +1363,7 @@ def run():
                             log_missed_trade(
                                 mint, name, symbol, ml_prob, 'PAPER_TRADING',
                                 'OUTSIDE_HOURS',
-                                f'hora={hour}h UTC fuera de {TRADE_HOURS_UTC}',
+                                f'hora={hour}h UTC fuera de {TRADE_HOURS_UTC_WINDOWS}',
                                 price, strategy='ALL'
                             )
 

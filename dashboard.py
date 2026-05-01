@@ -390,6 +390,104 @@ if not df_cap.empty and not df_trades_total.empty:
 
 st.markdown("<br>", unsafe_allow_html=True)
 
+# ── RISK & REGIME DASHBOARD ───────────────────────────
+st.markdown('<div class="section-title">🛡️ Risk & Regime</div>', unsafe_allow_html=True)
+
+df_regime = query("""
+    SELECT
+        COUNT(*) FILTER (WHERE pnl > 0)  AS wins,
+        COUNT(*) FILTER (WHERE pnl <= 0) AS losses
+    FROM paper_trades
+    WHERE status = 'CLOSED' AND closed_at > NOW() - INTERVAL '20 trades'
+      AND id IN (SELECT id FROM paper_trades WHERE status='CLOSED' ORDER BY closed_at DESC LIMIT 20)
+""")
+
+df_regime_wr = query("""
+    SELECT
+        ROUND(COUNT(*) FILTER (WHERE pnl > 0) * 100.0 / NULLIF(COUNT(*), 0), 1) AS wr_20
+    FROM (SELECT pnl FROM paper_trades WHERE status='CLOSED' ORDER BY closed_at DESC LIMIT 20) t
+""")
+
+df_wr7   = query("SELECT ROUND(COUNT(*) FILTER (WHERE pnl > 0)*100.0/NULLIF(COUNT(*),0),1) AS wr FROM paper_trades WHERE status='CLOSED' AND closed_at > NOW()-INTERVAL '7 days'")
+df_wr30  = query("SELECT ROUND(COUNT(*) FILTER (WHERE pnl > 0)*100.0/NULLIF(COUNT(*),0),1) AS wr FROM paper_trades WHERE status='CLOSED' AND closed_at > NOW()-INTERVAL '30 days'")
+df_scap  = query("SELECT strategy, capital, initial_capital, COALESCE(peak_capital, initial_capital) as peak FROM strategy_capital")
+
+r1, r2, r3, r4 = st.columns(4)
+
+with r1:
+    wr20 = float(df_regime_wr.iloc[0]['wr_20'] or 0) if not df_regime_wr.empty else 0
+    if wr20 >= 55:
+        regime, rcolor = "RISK ON", "#00ffa3"
+    elif wr20 >= 40:
+        regime, rcolor = "NEUTRAL", "#ffaa00"
+    else:
+        regime, rcolor = "RISK OFF", "#ff4466"
+    st.markdown(f'<div class="metric-card"><div class="metric-value" style="color:{rcolor};font-size:1.4rem">{regime}</div><div class="metric-label">Régimen (WR20)</div></div>', unsafe_allow_html=True)
+
+with r2:
+    if not df_scap.empty:
+        total_cap  = float(df_scap['capital'].sum())
+        total_peak = float(df_scap['peak'].sum())
+        dd_now = (total_peak - total_cap) / total_peak * 100 if total_peak > 0 else 0
+        dd_color = "#00ffa3" if dd_now < 5 else ("#ffaa00" if dd_now < 10 else "#ff4466")
+        st.markdown(f'<div class="metric-card"><div class="metric-value" style="color:{dd_color}">{dd_now:.1f}%</div><div class="metric-label">Drawdown desde Peak</div></div>', unsafe_allow_html=True)
+
+with r3:
+    wr7 = float(df_wr7.iloc[0]['wr'] or 0) if not df_wr7.empty else 0
+    c7  = "#00ffa3" if wr7 >= 50 else "#ff4466"
+    st.markdown(f'<div class="metric-card"><div class="metric-value" style="color:{c7}">{wr7:.0f}%</div><div class="metric-label">Win Rate 7d</div></div>', unsafe_allow_html=True)
+
+with r4:
+    wr30 = float(df_wr30.iloc[0]['wr'] or 0) if not df_wr30.empty else 0
+    c30  = "#00ffa3" if wr30 >= 50 else "#ff4466"
+    st.markdown(f'<div class="metric-card"><div class="metric-value" style="color:{c30}">{wr30:.0f}%</div><div class="metric-label">Win Rate 30d</div></div>', unsafe_allow_html=True)
+
+st.markdown("<br>", unsafe_allow_html=True)
+
+# ── Heatmap hora × día de semana ──────────────────────
+st.markdown('<div class="section-title">🗓️ Heatmap Win Rate — Hora UTC × Día</div>', unsafe_allow_html=True)
+df_heat = query("""
+    SELECT
+        EXTRACT(DOW  FROM opened_at AT TIME ZONE 'UTC') AS dow,
+        EXTRACT(HOUR FROM opened_at AT TIME ZONE 'UTC') AS hour_utc,
+        COUNT(*) AS trades,
+        ROUND(COUNT(*) FILTER (WHERE pnl > 0) * 100.0 / NULLIF(COUNT(*), 0), 1) AS win_rate
+    FROM paper_trades
+    WHERE status = 'CLOSED' AND opened_at IS NOT NULL
+    GROUP BY dow, hour_utc
+    HAVING COUNT(*) >= 2
+    ORDER BY dow, hour_utc
+""")
+if not df_heat.empty:
+    df_heat['dow']      = df_heat['dow'].astype(int)
+    df_heat['hour_utc'] = df_heat['hour_utc'].astype(int)
+    df_heat['win_rate'] = df_heat['win_rate'].astype(float)
+    DAY_NAMES = {0:'Dom', 1:'Lun', 2:'Mar', 3:'Mié', 4:'Jue', 5:'Vie', 6:'Sáb'}
+    df_heat['day_name'] = df_heat['dow'].map(DAY_NAMES)
+    pivot = df_heat.pivot_table(index='day_name', columns='hour_utc',
+                                values='win_rate', aggfunc='mean')
+    day_order = ['Lun','Mar','Mié','Jue','Vie','Sáb','Dom']
+    pivot = pivot.reindex([d for d in day_order if d in pivot.index])
+    fig_heat = go.Figure(go.Heatmap(
+        z=pivot.values, x=pivot.columns.tolist(), y=pivot.index.tolist(),
+        colorscale=[[0,'rgba(255,68,102,0.8)'], [0.5,'rgba(255,170,0,0.8)'],
+                    [1,'rgba(0,255,163,0.8)']],
+        zmin=0, zmax=100,
+        text=[[f"{v:.0f}%" if not pd.isna(v) else "" for v in row] for row in pivot.values],
+        texttemplate="%{text}", textfont=dict(size=9),
+        showscale=True, colorbar=dict(ticksuffix='%', thickness=12)
+    ))
+    fig_heat.update_layout(
+        paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)',
+        font=dict(family='Share Tech Mono', color='rgba(0,255,163,0.6)', size=10),
+        xaxis=dict(title='Hora UTC', gridcolor='rgba(0,255,163,0.06)'),
+        yaxis=dict(gridcolor='rgba(0,255,163,0.06)'),
+        margin=dict(l=0, r=0, t=10, b=0), height=220
+    )
+    st.plotly_chart(fig_heat, use_container_width=True)
+
+st.markdown("<br>", unsafe_allow_html=True)
+
 # ── Equity Curve + Drawdown ───────────────────────────
 perf_left, perf_right = st.columns([2, 1])
 

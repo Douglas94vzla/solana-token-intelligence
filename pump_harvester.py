@@ -30,6 +30,7 @@ WSS_ENDPOINTS = [ep for ep in [
     {"name": "Helius",  "url": os.getenv("WSS_URL_1")},
     {"name": "Ankr",    "url": os.getenv("WSS_URL_2")},
     {"name": "Oficial", "url": os.getenv("WSS_URL_3")},
+    {"name": "dRPC",    "url": os.getenv("WSS_URL_4")},
 ] if ep["url"]]
 
 # Backoff por endpoint: intentos fallidos consecutivos → segundos de espera

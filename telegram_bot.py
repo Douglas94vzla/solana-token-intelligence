@@ -170,3 +170,41 @@ def alert_missed_summary(missed_rows):
 
     lines.append(f"📅 {datetime.now().strftime('%Y-%m-%d')}")
     return send_message("\n".join(lines))
+
+def alert_feature_drift(drifted: list):
+    """Alerta cuando las features actuales divergen del dataset de entrenamiento (KS test)."""
+    if not drifted:
+        return
+    feats = ", ".join(drifted[:6])
+    more  = f" (+{len(drifted)-6} más)" if len(drifted) > 6 else ""
+    msg = (
+        f"⚠️ <b>FEATURE DRIFT DETECTADO</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"📊 Features con drift: <b>{len(drifted)}</b>\n"
+        f"🔍 {feats}{more}\n"
+        f"⚠️ El modelo puede estar prediciendo con datos fuera de distribución.\n"
+        f"📅 {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+    )
+    return send_message(msg)
+
+def alert_consecutive_losses(streak: int, strategy: str):
+    """Alerta si hay N trades consecutivos perdedores."""
+    msg = (
+        f"🔴 <b>RACHA PERDEDORA [{strategy}]</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"❌ {streak} trades consecutivos en pérdida\n"
+        f"💡 Considera revisar condiciones de mercado\n"
+        f"📅 {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+    )
+    return send_message(msg)
+
+def alert_no_ml_samples(hours: float):
+    """Alerta si no se han capturado muestras ML limpias en X horas."""
+    msg = (
+        f"⚠️ <b>SIN MUESTRAS ML LIMPIAS</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"⏱ {hours:.1f}h sin nuevas capturas en token_features_at_signal\n"
+        f"🔍 Verificar survival_scorer.py y entry_signal.py\n"
+        f"📅 {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+    )
+    return send_message(msg)

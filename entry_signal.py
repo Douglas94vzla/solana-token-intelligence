@@ -42,7 +42,12 @@ def load_ml_model():
             model = pickle.load(f)
         with open(FEATURES_PATH, 'rb') as f:
             saved = pickle.load(f)
-        log.info("✅ Modelo ML cargado")
+        if isinstance(model, dict):
+            n = len(model.get('models', []))
+            w = [f"{x:.3f}" for x in model.get('weights', [])]
+            log.info(f"✅ Ensemble ML cargado ({n} modelos, pesos={w})")
+        else:
+            log.info("✅ Modelo ML cargado (single model)")
         return model, saved['label_encoder']
     except Exception as e:
         log.warning(f"⚠️  Modelo ML no disponible: {e} — usando reglas manuales")
@@ -377,12 +382,107 @@ def ml_predict(mint):
         ]
 
         X = df[features].fillna(0).values
-        proba = float(ml_model.predict_proba(X)[0][1])
+        if isinstance(ml_model, dict):
+            proba = sum(
+                w * float(m.predict_proba(X)[0][1])
+                for m, w in zip(ml_model['models'], ml_model['weights'])
+            )
+        else:
+            proba = float(ml_model.predict_proba(X)[0][1])
         return round(proba * 100, 1), proba >= ML_THRESHOLD
 
     except Exception as e:
         log.warning(f"ML predict error para {mint[:8]}: {e}")
         return None, True
+
+def capture_features_at_enter(mint):
+    """
+    Captura features al momento exacto del ENTER signal — después de que DexScreener
+    tiene un pair y narrative_engine ha clasificado el token.
+    DO UPDATE sobrescribe registros anteriores con liquidity_usd=0 capturados al BUY.
+    """
+    conn = pool.getconn()
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO token_features_at_signal (
+                mint, signal, captured_at, price_at_signal,
+                buys_5m, sells_5m, market_cap, volume_24h, volume_1h, volume_5m,
+                survival_score, narrative, buys_1h, sells_1h, buys_24h, sells_24h,
+                rug_score, holder_count, top10_concentration, dev_sold,
+                has_twitter, has_telegram, has_website, launch_hour,
+                liquidity_usd, fdv, smart_money_bought, narrative_momentum,
+                deployer_prior_tokens, deployer_rugged_count, deployer_rug_rate,
+                is_known_rugger, deployer_known
+            )
+            SELECT
+                dt.mint, 'ENTER', NOW(), dt.price_usd,
+                dt.buys_5m, dt.sells_5m, dt.market_cap, dt.volume_24h,
+                COALESCE(dt.volume_1h, 0), COALESCE(dt.volume_5m, 0),
+                dt.survival_score, dt.narrative, dt.buys_1h, dt.sells_1h,
+                COALESCE(dt.buys_24h, 0), COALESCE(dt.sells_24h, 0),
+                COALESCE(dt.rug_score, 50), COALESCE(dt.holder_count, 10),
+                COALESCE(dt.top10_concentration, 95), COALESCE(dt.dev_sold, FALSE),
+                (dt.twitter IS NOT NULL), (dt.telegram IS NOT NULL), (dt.website IS NOT NULL),
+                EXTRACT(HOUR FROM dt.created_at),
+                COALESCE(dt.liquidity_usd, 0), COALESCE(dt.fdv, 0),
+                CASE WHEN EXISTS (
+                    SELECT 1 FROM wallet_activity wa
+                    JOIN smart_wallets sw ON sw.wallet = wa.wallet
+                    WHERE wa.mint = dt.mint AND sw.is_smart = TRUE
+                ) THEN 1 ELSE 0 END,
+                COALESCE((
+                    SELECT ns.momentum FROM narrative_stats ns
+                    WHERE ns.narrative = dt.narrative AND ns.window_hours = 24
+                    ORDER BY ns.calculated_at DESC LIMIT 1
+                ), 0),
+                COALESCE(ds.total_tokens, 0), COALESCE(ds.rugged_count, 0),
+                COALESCE(ds.rug_rate, 0.5), COALESCE(ds.is_serial_rugger::int, 0),
+                (dt.deployer_wallet IS NOT NULL)::int
+            FROM discovered_tokens dt
+            LEFT JOIN deployer_stats ds ON ds.wallet = dt.deployer_wallet
+            WHERE dt.mint = %s
+            ON CONFLICT (mint) DO UPDATE SET
+                signal                = EXCLUDED.signal,
+                captured_at           = EXCLUDED.captured_at,
+                price_at_signal       = EXCLUDED.price_at_signal,
+                buys_5m               = EXCLUDED.buys_5m,
+                sells_5m              = EXCLUDED.sells_5m,
+                market_cap            = EXCLUDED.market_cap,
+                volume_24h            = EXCLUDED.volume_24h,
+                volume_1h             = EXCLUDED.volume_1h,
+                volume_5m             = EXCLUDED.volume_5m,
+                survival_score        = EXCLUDED.survival_score,
+                narrative             = EXCLUDED.narrative,
+                buys_1h               = EXCLUDED.buys_1h,
+                sells_1h              = EXCLUDED.sells_1h,
+                buys_24h              = EXCLUDED.buys_24h,
+                sells_24h             = EXCLUDED.sells_24h,
+                rug_score             = EXCLUDED.rug_score,
+                holder_count          = EXCLUDED.holder_count,
+                top10_concentration   = EXCLUDED.top10_concentration,
+                dev_sold              = EXCLUDED.dev_sold,
+                has_twitter           = EXCLUDED.has_twitter,
+                has_telegram          = EXCLUDED.has_telegram,
+                has_website           = EXCLUDED.has_website,
+                launch_hour           = EXCLUDED.launch_hour,
+                liquidity_usd         = EXCLUDED.liquidity_usd,
+                fdv                   = EXCLUDED.fdv,
+                smart_money_bought    = EXCLUDED.smart_money_bought,
+                narrative_momentum    = EXCLUDED.narrative_momentum,
+                deployer_prior_tokens = EXCLUDED.deployer_prior_tokens,
+                deployer_rugged_count = EXCLUDED.deployer_rugged_count,
+                deployer_rug_rate     = EXCLUDED.deployer_rug_rate,
+                is_known_rugger       = EXCLUDED.is_known_rugger,
+                deployer_known        = EXCLUDED.deployer_known
+        """, (mint,))
+        conn.commit()
+        cur.close()
+    except Exception as e:
+        log.warning(f"capture_features_at_enter falló para {mint[:8]}: {e}")
+        conn.rollback()
+    finally:
+        pool.putconn(conn)
 
 def is_rug_safe(mint):
     """Retorna True si el token pasa el filtro de rug"""
@@ -584,6 +684,7 @@ async def monitor_cycle():
 
                 if signal == 'ENTER':
                     enters += 1
+                    capture_features_at_enter(mint)
                     log.info(
                         f"🚨 ENTER | {name or mint[:8]} ({symbol}) | "
                         f"Score:{score} | Momentum:{momentum} | "

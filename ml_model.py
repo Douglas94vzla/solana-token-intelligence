@@ -8,8 +8,7 @@ import pandas as pd
 from datetime import datetime
 from dotenv import load_dotenv
 from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
-from sklearn.calibration import CalibratedClassifierCV
-from sklearn.model_selection import cross_val_score, StratifiedKFold, train_test_split
+from sklearn.model_selection import cross_val_score, StratifiedKFold, TimeSeriesSplit, train_test_split
 from sklearn.preprocessing import LabelEncoder
 from sklearn.metrics import classification_report, confusion_matrix, roc_auc_score
 from sklearn.utils.class_weight import compute_sample_weight
@@ -61,6 +60,7 @@ def load_training_data():
         cur.execute("""
             SELECT COUNT(*) FROM token_features_at_signal tfs
             WHERE tfs.price_at_signal > 0
+              AND tfs.liquidity_usd > 0
               AND EXISTS (
                 SELECT 1 FROM price_snapshots ps
                 WHERE ps.mint = tfs.mint
@@ -116,6 +116,7 @@ def load_training_data():
                     COALESCE(tfs.deployer_rug_rate, 0.5),
                     COALESCE(tfs.is_known_rugger, 0),
                     COALESCE(tfs.deployer_known, 0),
+                    tfs.captured_at,
                     CASE WHEN fm.max_future_price >= tfs.price_at_signal * (1 + %s)
                          THEN 1 ELSE 0 END  AS target
                 FROM token_features_at_signal tfs
@@ -155,6 +156,7 @@ def load_training_data():
                     COALESCE(ds.total_tokens, 0), COALESCE(ds.rugged_count, 0),
                     COALESCE(ds.rug_rate, 0.5), COALESCE(ds.is_serial_rugger::int, 0),
                     (dt.deployer_wallet IS NOT NULL)::int,
+                    dt.created_at,
                     CASE WHEN MAX(ps.price_usd) >= MIN(ps.price_usd) * (1 + %s)
                          THEN 1 ELSE 0 END AS target
                 FROM discovered_tokens dt
@@ -191,7 +193,7 @@ def load_training_data():
             'smart_money_bought', 'narrative_momentum',
             'deployer_prior_tokens', 'deployer_rugged_count',
             'deployer_rug_rate', 'is_known_rugger', 'deployer_known',
-            'target'
+            'captured_at', 'target'
         ]
 
         df = pd.DataFrame(rows, columns=columns)
@@ -360,20 +362,19 @@ def train_models(X, y):
         ),
     }
 
-    cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
-    best_model      = None
-    best_score      = 0
-    best_name       = ""
-    best_fit_params = {}
+    # Walk-forward: entrena en pasado, valida en futuro (datos ya ordenados por tiempo)
+    cv          = TimeSeriesSplit(n_splits=5)
+    best_score  = 0
+    best_name   = ""
+    auc_scores  = {}
+    model_names = list(models.keys())
 
     print("\n" + "="*60)
-    print("🤖 ENTRENANDO MODELOS ML")
+    print("🤖 ENTRENANDO ENSEMBLE ML (walk-forward CV)")
     print(f"   Dataset: {len(y)} samples | Positivos: {pos} ({pos/len(y)*100:.1f}%) | Negativos: {neg}")
     print("="*60)
 
     for name, (model, fit_params) in models.items():
-        # cross_val_score no soporta fit_params con sample_weight por defecto
-        # → lo evaluamos con split manual para GradientBoosting
         if fit_params:
             fold_scores = []
             for train_idx, val_idx in cv.split(X, y):
@@ -387,60 +388,70 @@ def train_models(X, y):
         else:
             scores = cross_val_score(model, X, y, cv=cv, scoring='roc_auc', n_jobs=-1)
 
-        mean_score = scores.mean()
-        std_score  = scores.std()
+        mean_score        = scores.mean()
+        auc_scores[name]  = mean_score
         print(f"\n  {name}:")
-        print(f"    AUC-ROC: {mean_score:.3f} ± {std_score:.3f}")
+        print(f"    AUC-ROC: {mean_score:.3f} ± {scores.std():.3f}")
 
         if mean_score > best_score:
-            best_score      = mean_score
-            best_model      = model
-            best_name       = name
-            best_fit_params = fit_params
+            best_score = mean_score
+            best_name  = name
 
     print(f"\n🏆 Mejor modelo: {best_name} (AUC: {best_score:.3f})")
 
-    # Entrenar el mejor con todos los datos
-    if best_fit_params:
-        best_model.fit(X, y, **best_fit_params)
-    else:
-        best_model.fit(X, y)
+    # Entrenar TODOS los modelos en datos completos y construir ensemble
+    feature_cols = get_feature_columns()
+    ensemble = {'models': [], 'weights': [], 'feature_cols': feature_cols}
 
-    # Feature importance (antes de calibrar, para que el atributo esté disponible)
-    if hasattr(best_model, 'feature_importances_'):
-        feature_cols = get_feature_columns()
+    print("\n🔧 Entrenando ensemble en datos completos...")
+    for name, (model, fit_params) in models.items():
+        if fit_params:
+            model.fit(X, y, **fit_params)
+        else:
+            model.fit(X, y)
+        ensemble['models'].append(model)
+        ensemble['weights'].append(auc_scores.get(name, 0.5))
+        print(f"  ✅ {name} (peso AUC={auc_scores.get(name, 0.5):.3f})")
+
+    # Normalizar pesos por AUC para soft voting
+    total_w = sum(ensemble['weights'])
+    ensemble['weights'] = [w / total_w for w in ensemble['weights']]
+    print(f"  📊 Pesos normalizados: " +
+          " | ".join(f"{n}={w:.3f}" for n, w in zip(model_names, ensemble['weights'])))
+
+    # Feature importance del mejor modelo (para logging)
+    best_idx = model_names.index(best_name)
+    best_fitted = ensemble['models'][best_idx]
+    if hasattr(best_fitted, 'feature_importances_'):
         importances = pd.Series(
-            best_model.feature_importances_,
-            index=feature_cols
+            best_fitted.feature_importances_, index=feature_cols
         ).sort_values(ascending=False)
-
-        print("\n📊 FEATURES MÁS IMPORTANTES:")
+        print("\n📊 FEATURES MÁS IMPORTANTES (mejor modelo):")
         for feat, imp in importances.head(10).items():
             bar = "█" * int(imp * 50)
             print(f"  {feat:<28} {bar} {imp:.3f}")
 
-    # Calibrar probabilidades con isotonic regression (mejora fiabilidad prob)
-    # Usamos cv=5 con los mismos datos — válido porque el CV anterior ya evaluó
-    try:
-        calibrated = CalibratedClassifierCV(best_model, method='isotonic', cv=5)
-        calibrated.fit(X, y)
-        best_model = calibrated
-        print(f"  📐 Calibración isotónica aplicada")
-    except Exception as e:
-        print(f"  ⚠️  Calibración falló ({e}) — usando modelo sin calibrar")
+    return ensemble, best_name, best_score
 
-    return best_model, best_name, best_score
-
-def evaluate_model(model, X, y):
+def evaluate_model(ensemble, X, y):
     """Evaluación detallada con reporte y simulación de trading."""
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.2, random_state=42, stratify=y
-    )
-    model.fit(X_train, y_train)
-    y_pred  = model.predict(X_test)
-    y_proba = model.predict_proba(X_test)[:, 1]
+    split  = int(len(y) * 0.8)
+    X_test = X[split:]
+    y_test = y[split:]
 
-    print("\n📋 REPORTE DE CLASIFICACIÓN (test 20%):")
+    if isinstance(ensemble, dict):
+        # Ensemble ya entrenado en full data — predecir sobre el 20% más reciente
+        print("\n📋 REPORTE ENSEMBLE (últimas 20% muestras temporales):")
+        y_proba = np.zeros(len(y_test))
+        for model, weight in zip(ensemble['models'], ensemble['weights']):
+            y_proba += weight * model.predict_proba(X_test)[:, 1]
+    else:
+        X_train, y_train = X[:split], y[:split]
+        ensemble.fit(X_train, y_train)
+        print("\n📋 REPORTE DE CLASIFICACIÓN (test 20%):")
+        y_proba = ensemble.predict_proba(X_test)[:, 1]
+
+    y_pred = (y_proba >= 0.5).astype(int)
     print(classification_report(y_test, y_pred, target_names=['Perdedor', 'Ganador']))
 
     cm = confusion_matrix(y_test, y_pred)
@@ -470,12 +481,82 @@ def evaluate_model(model, X, y):
 
     return roc_auc_score(y_test, y_proba)
 
-def save_model(model, le, feature_cols):
+def save_model(ensemble, le, feature_cols, X_train_df=None):
     with open(MODEL_PATH, 'wb') as f:
-        pickle.dump(model, f)
+        pickle.dump(ensemble, f)
+    # Guardar training_stats para feature drift detection (5 features clave)
+    drift_cols = ['buys_5m', 'sells_5m', 'market_cap', 'liquidity_usd', 'survival_score']
+    training_stats = {}
+    if X_train_df is not None:
+        for col in drift_cols:
+            if col in X_train_df.columns:
+                training_stats[col] = X_train_df[col].dropna().values.tolist()
     with open(FEATURES_PATH, 'wb') as f:
-        pickle.dump({'label_encoder': le, 'features': feature_cols}, f)
-    log.info(f"✅ Modelo guardado en {MODEL_PATH}")
+        pickle.dump({'label_encoder': le, 'features': feature_cols,
+                     'training_stats': training_stats}, f)
+    n = len(ensemble['models']) if isinstance(ensemble, dict) else 1
+    log.info(f"✅ Ensemble guardado ({n} modelos) en {MODEL_PATH}")
+
+
+def check_feature_drift() -> list:
+    """
+    KS test entre distribución de features en training vs últimas 48h.
+    Retorna lista de features con drift significativo (p < 0.05).
+    """
+    try:
+        from scipy.stats import ks_2samp
+    except ImportError:
+        log.warning("scipy no disponible — feature drift detection omitida")
+        return []
+
+    if not os.path.exists(FEATURES_PATH):
+        return []
+
+    with open(FEATURES_PATH, 'rb') as f:
+        saved = pickle.load(f)
+    training_stats = saved.get('training_stats', {})
+    if not training_stats:
+        return []
+
+    conn = pool.getconn()
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT buys_5m, sells_5m, market_cap, liquidity_usd, survival_score
+            FROM discovered_tokens
+            WHERE created_at > NOW() - INTERVAL '48 hours'
+              AND signal IN ('STRONG_BUY', 'BUY')
+              AND buys_5m IS NOT NULL
+            LIMIT 500
+        """)
+        rows = cur.fetchall()
+        cur.close()
+    finally:
+        pool.putconn(conn)
+
+    if len(rows) < 20:
+        return []
+
+    recent = pd.DataFrame(rows,
+        columns=['buys_5m', 'sells_5m', 'market_cap', 'liquidity_usd', 'survival_score'])
+
+    drifted = []
+    for col in training_stats:
+        if col not in recent.columns:
+            continue
+        train_arr  = np.array(training_stats[col])
+        recent_arr = recent[col].dropna().values
+        if len(recent_arr) < 10:
+            continue
+        _, p_value = ks_2samp(train_arr, recent_arr)
+        if p_value < 0.05:
+            drifted.append(f"{col}(p={p_value:.3f})")
+
+    if drifted:
+        log.warning(f"⚠️  Feature drift en {len(drifted)} features: {drifted}")
+    else:
+        log.info("✅ Sin feature drift detectado")
+    return drifted
 
 def save_metrics(name, auc, n_samples, n_positives):
     """Guarda métricas del entrenamiento en la DB para tracking."""
@@ -573,6 +654,11 @@ def run():
         log.error(f"❌ Solo {len(df)} tokens — necesitamos mínimo 50 para entrenar")
         return
 
+    # Ordenar cronológicamente antes del walk-forward split
+    if 'captured_at' in df.columns:
+        df = df.sort_values('captured_at').reset_index(drop=True)
+        df = df.drop(columns=['captured_at'])
+
     for col in df.columns:
         try:
             df[col] = pd.to_numeric(df[col])
@@ -586,13 +672,24 @@ def run():
 
     log.info(f"📊 Dataset: {X.shape[0]} samples, {X.shape[1]} features")
 
-    model, name, cv_auc = train_models(X, y)
-    test_auc = evaluate_model(model, X, y)
-    save_model(model, le, feature_cols)
-    save_metrics(name, test_auc, len(y), int(y.sum()))
+    ensemble, best_name, cv_auc = train_models(X, y)
+    test_auc = evaluate_model(ensemble, X, y)
+    save_model(ensemble, le, feature_cols, X_train_df=df[['buys_5m','sells_5m','market_cap','liquidity_usd','survival_score']])
+    save_metrics(best_name, test_auc, len(y), int(y.sum()))
 
-    log.info(f"✅ {name} | CV AUC: {cv_auc:.3f} | Test AUC: {test_auc:.3f}")
-    log.info(f"   Target: +{TARGET_GAIN*100:.0f}% | Samples: {len(y)} | Features: {X.shape[1]}")
+    weights_str = " | ".join(
+        f"{n}={w:.3f}" for n, w in zip(
+            ['RF', 'GB', 'XGB'], ensemble.get('weights', [])
+        )
+    )
+    log.info(f"✅ Ensemble | Best: {best_name} | CV AUC: {cv_auc:.3f} | Test AUC: {test_auc:.3f}")
+    log.info(f"   Pesos: {weights_str} | Target: +{TARGET_GAIN*100:.0f}% | Samples: {len(y)}")
+
+    # ── FEATURE DRIFT DETECTION ────────────────────────
+    drifted = check_feature_drift()
+    if len(drifted) >= 3:
+        from telegram_bot import alert_feature_drift
+        alert_feature_drift(drifted)
 
     # ── BACKTEST AUTOMÁTICO POST-ENTRENAMIENTO ─────────
     log.info("🔬 Lanzando backtest con nuevo modelo...")

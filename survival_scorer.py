@@ -255,8 +255,9 @@ def score_recent_tokens():
                 WHERE mint = %s
             """, (score, signal, token['mint']))
 
-            if signal in ('STRONG_BUY', 'BUY'):
-                capture_features_at_signal(cur, token['mint'], signal)
+            # capture_features_at_signal disabled — capture now happens at ENTER
+            # time in entry_signal.py (capture_features_at_enter) so liquidity_usd
+            # and narrative are populated when DexScreener pair exists.
 
             results[signal] += 1
 

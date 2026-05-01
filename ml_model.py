@@ -688,8 +688,7 @@ def run():
     # ── FEATURE DRIFT DETECTION ────────────────────────
     drifted = check_feature_drift()
     if len(drifted) >= 3:
-        from telegram_bot import alert_feature_drift
-        alert_feature_drift(drifted)
+        log.warning(f"⚠️ Feature drift detectado en {len(drifted)} features: {drifted[:6]}")
 
     # ── BACKTEST AUTOMÁTICO POST-ENTRENAMIENTO ─────────
     log.info("🔬 Lanzando backtest con nuevo modelo...")

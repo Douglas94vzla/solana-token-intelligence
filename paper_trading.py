@@ -8,9 +8,7 @@ import statistics
 import requests
 from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
-from telegram_bot import (alert_paper_trade, alert_daily_summary,
-                           alert_system_status, send_message,
-                           alert_consecutive_losses, alert_no_ml_samples)
+from telegram_bot import (alert_paper_trade, send_message)
 
 load_dotenv('/root/solana_bot/.env')
 
@@ -45,7 +43,10 @@ MAX_HOLD_MINUTES      = 30       # Timeout 30 minutos (tokens que no despegan en
 DAILY_LOSS_LIMIT      = 0.03     # Parar si perdemos 3% en el día
 SLIPPAGE              = 0.03     # Slippage base (fallback si no hay liquidez)
 FEES                  = 0.005    # 0.5% fees
-TRADE_HOURS_UTC_WINDOWS = [(13, 18), (22, 24)]  # 13–17h y 22–23h UTC (evita 18–21h: WR 35–41%)
+TRADE_HOURS_UTC_WINDOWS         = [(13, 18), (22, 24)]   # 13–17h y 22–23h UTC (evita 18–21h: WR 35–41%)
+SATURDAY_HOURS_UTC              = [(14, 15), (17, 18)]    # Sábado: solo las 2 ventanas con WR>55%
+SATURDAY_ML_MIN                 = 90                      # Sábado: exigir ML >= 90% (vs 80% normal)
+SATURDAY_SIZE_FACTOR            = 0.5                     # Sábado: mitad de tamaño de posición
 POSITION_CHECK_INTERVAL = 10     # Revisar posiciones abiertas cada 10s
 SIGNAL_CHECK_INTERVAL   = 60     # Buscar señales nuevas cada 60s
 STOP_LOSS_MIN         = 0.85     # Stop adaptativo mínimo: -15%
@@ -398,15 +399,7 @@ def get_drawdown_factor(strategy: str) -> float:
         log.warning(f"📉 [{strategy}] Drawdown {drawdown*100:.1f}% — sizing ×0.50")
         return 0.50
     # > 15%: pausa total
-    now_ts = time.monotonic()
-    if now_ts - _dd_alerted.get(strategy, 0) > 3600:
-        _dd_alerted[strategy] = now_ts
-        send_message(
-            f"🚨 DRAWDOWN CRÍTICO [{strategy}] | "
-            f"{drawdown*100:.1f}% desde pico ${peak:.2f} → ${current:.2f} | "
-            f"⛔ Pausando nuevas entradas"
-        )
-        log.error(f"🚨 [{strategy}] Drawdown {drawdown*100:.1f}% > 15% — PAUSANDO")
+    log.error(f"🚨 [{strategy}] Drawdown {drawdown*100:.1f}% > 15% — PAUSANDO")
     return 0.0
 
 
@@ -452,11 +445,7 @@ def get_macro_risk() -> tuple:
     else:
         return False, ""
 
-    # Alerta Telegram throttled a 1 vez/hora
-    if now_ts - _macro_alerted_at > 3600:
-        _macro_alerted_at = now_ts
-        send_message(f"🌍 MACRO RISK-OFF | {motivo} | ⛔ Pausando nuevas entradas")
-        log.warning(f"🌍 MACRO RISK-OFF: {motivo}")
+    log.warning(f"🌍 MACRO RISK-OFF: {motivo}")
 
     return True, motivo
 
@@ -703,7 +692,8 @@ def check_new_signals(ml_min=65):
                 dt.pair_address IS NULL                    -- bonding curve: sin par DexScreener
                 OR dt.liquidity_usd >= 5000               -- con par: liquidez mínima (subido de 3k)
               )
-              AND (dt.rug_flags IS NULL OR dt.rug_flags NOT LIKE '%%NEAR_ZERO_LIQUIDITY%%')
+              AND (dt.rug_flags IS NULL OR dt.rug_flags NOT LIKE '%%NEAR_ZERO_LIQUIDITY%%'
+                   OR dt.liquidity_usd >= 5000)
               AND (dt.price_change_1h IS NULL OR dt.price_change_1h > -70)
               AND (dt.narrative IS NULL OR dt.narrative NOT IN ('AI/AGI', 'IDENTITY', 'NUMBERS'))
               AND dt.mint NOT IN (
@@ -763,70 +753,130 @@ def is_daily_limit_hit():
 
 def is_trading_hours():
     """Solo abrir trades en ventanas de mayor win rate histórico.
-    Excluye: sábados (WR 41%), horas 18–21h UTC (WR 35–41%).
+    Sábado: modo cauteloso — ventanas reducidas, ML más alto, posiciones más chicas.
+    Domingo: excluido (WR 47% pero PnL total negativo -$142).
     """
     now_utc = datetime.now(timezone.utc)
-    if now_utc.weekday() == 5:  # 5 = sábado
+    dow = now_utc.weekday()  # 5=sábado, 6=domingo
+    if dow == 6:
         return False
     hour = now_utc.hour
+    if dow == 5:
+        return any(start <= hour < end for start, end in SATURDAY_HOURS_UTC)
     return any(start <= hour < end for start, end in TRADE_HOURS_UTC_WINDOWS)
 
+def is_saturday_mode() -> bool:
+    return datetime.now(timezone.utc).weekday() == 5
+
 def send_daily_summary():
-    """Envía resumen diario por Telegram con métricas del día."""
+    """Envía resumen diario detallado a las 6 PM hora Barquisimeto."""
     cap  = get_capital()
     conn = pool.getconn()
     try:
         cur = conn.cursor()
-        cur.execute("""
-            SELECT
-                COUNT(*) FILTER (WHERE pnl > 0)                 as wins,
-                COUNT(*) FILTER (WHERE pnl <= 0)                as losses,
-                COALESCE(MAX(pnl_pct), 0)                       as best_pct,
-                COALESCE(MIN(pnl_pct), 0)                       as worst_pct,
-                COALESCE(SUM(pnl) FILTER (WHERE closed_at::date = CURRENT_DATE - 1), 0) as day_pnl
-            FROM paper_trades
-            WHERE status = 'CLOSED'
-        """)
-        row = cur.fetchone()
-        wins, losses, best_pct, worst_pct, day_pnl = row
-        total = (wins or 0) + (losses or 0)
-        win_rate = (wins / total * 100) if total > 0 else 0
-        pnl_pct  = (float(cap['daily_pnl']) / INITIAL_CAPITAL) * 100
+        today = (datetime.now() - timedelta(seconds=1)).date()  # el día que acaba de cerrar
 
-        # ── MISSED TRADES DEL DÍA ───────────────────────
+        # ── TRADES DEL DÍA ────────────────────────────────
+        cur.execute("""
+            SELECT symbol, name, ROUND(pnl_pct::numeric,2), ROUND(pnl::numeric,4),
+                   exit_reason, strategy, ml_probability,
+                   TO_CHAR(opened_at,'HH24:MI'), TO_CHAR(closed_at,'HH24:MI')
+            FROM paper_trades
+            WHERE status='CLOSED' AND DATE(opened_at) = %s
+            ORDER BY opened_at
+        """, (today,))
+        day_trades = cur.fetchall()
+
+        day_wins   = sum(1 for t in day_trades if float(t[2] or 0) > 0)
+        day_losses = sum(1 for t in day_trades if float(t[2] or 0) <= 0)
+        day_pnl    = sum(float(t[3] or 0) for t in day_trades)
+        day_total  = len(day_trades)
+        day_wr     = round(day_wins / day_total * 100) if day_total else 0
+        best_today = max((float(t[2] or 0) for t in day_trades), default=0)
+        worst_today= min((float(t[2] or 0) for t in day_trades), default=0)
+
+        # ── STATS TOTALES HISTÓRICOS ──────────────────────
         cur.execute("""
             SELECT
-                COUNT(*)                                                   as total_missed,
-                COUNT(*) FILTER (WHERE tracked_1h)                         as tracked,
-                COALESCE(AVG(pnl_pct_1h) FILTER (WHERE tracked_1h), 0)    as avg_pnl_1h,
-                COALESCE(SUM(phantom_pnl_1h) FILTER (WHERE tracked_1h), 0) as phantom_total,
-                COUNT(*) FILTER (WHERE pnl_pct_1h > 0 AND tracked_1h)     as would_wins,
-                MAX(pnl_pct_1h) FILTER (WHERE tracked_1h)                  as best_missed_pct,
-                (ARRAY_AGG(name ORDER BY pnl_pct_1h DESC NULLS LAST))[1]  as best_missed_name,
-                rejection_reason
-            FROM missed_trades
-            WHERE DATE(missed_at) = CURRENT_DATE - 1
-            GROUP BY rejection_reason
-            ORDER BY SUM(phantom_pnl_1h) DESC NULLS LAST
+                COUNT(*) as total,
+                SUM(CASE WHEN pnl>0 THEN 1 ELSE 0 END) as wins,
+                SUM(CASE WHEN pnl<=0 THEN 1 ELSE 0 END) as losses,
+                ROUND(SUM(pnl)::numeric, 2) as total_pnl,
+                ROUND(AVG(pnl_pct)::numeric, 2) as avg_pct,
+                ROUND(MAX(pnl_pct)::numeric, 2) as best_pct,
+                ROUND(MIN(pnl_pct)::numeric, 2) as worst_pct,
+                MIN(DATE(opened_at)) as desde
+            FROM paper_trades WHERE status='CLOSED'
         """)
-        missed_rows = cur.fetchall()
+        tot = cur.fetchone()
+        tot_total, tot_wins, tot_losses, tot_pnl, tot_avg, tot_best, tot_worst, desde = tot
+        tot_wr = round(float(tot_wins or 0) / float(tot_total or 1) * 100, 1)
+
+        # ── ÚLTIMOS 7 DÍAS ────────────────────────────────
+        cur.execute("""
+            SELECT DATE(opened_at) as d,
+                   COUNT(*) as n,
+                   SUM(CASE WHEN pnl>0 THEN 1 ELSE 0 END) as w,
+                   ROUND(SUM(pnl)::numeric,2) as pnl
+            FROM paper_trades WHERE status='CLOSED'
+              AND DATE(opened_at) >= CURRENT_DATE - 7
+            GROUP BY d ORDER BY d DESC
+        """)
+        week = cur.fetchall()
         cur.close()
 
-        alert_daily_summary(
-            capital   = cap['capital'],
-            pnl       = cap['daily_pnl'],
-            pnl_pct   = pnl_pct,
-            wins      = wins or 0,
-            losses    = losses or 0,
-            best_trade= f"{float(best_pct):+.1f}%"
-        )
+        emoji_day = "📈" if day_pnl > 0 else "📉"
+        lines = [
+            f"{emoji_day} <b>REPORTE DIARIO — {today.strftime('%d/%m/%Y')}</b>",
+            f"━━━━━━━━━━━━━━━━━━━━",
+            f"",
+            f"<b>[ HOY ]</b>",
+            f"• Trades: {day_total}  ✅{day_wins}  ❌{day_losses}  WR:{day_wr}%",
+            f"• PnL: <b>${day_pnl:+.2f}</b>",
+            f"• Mejor: {best_today:+.1f}%  |  Peor: {worst_today:+.1f}%",
+        ]
 
-        if missed_rows:
-            from telegram_bot import alert_missed_summary
-            alert_missed_summary(missed_rows)
+        if day_trades:
+            lines.append(f"")
+            lines.append(f"<b>[ TRADES HOY ]</b>")
+            for t in day_trades:
+                sym, name, pct, usd, reason, strat, ml, t_open, t_close = t
+                e = "✅" if float(pct or 0) > 0 else "❌"
+                strat_short = "STD" if strat == "STANDARD" else "CON"
+                lines.append(
+                    f"{e} {sym or (name or '?')[:8]} | {float(pct):+.1f}% ${float(usd):+.2f}"
+                    f" | {reason} | {strat_short} | {t_open}-{t_close}"
+                )
 
+        lines += [
+            f"",
+            f"<b>[ ÚLTIMOS 7 DÍAS ]</b>",
+        ]
+        for w in week:
+            d, n, ww, wpnl = w
+            wwr = round(float(ww or 0)/float(n or 1)*100)
+            arrow = "📈" if float(wpnl or 0) > 0 else "📉"
+            lines.append(f"{arrow} {d.strftime('%d/%m')}: {n}t {wwr}%WR ${float(wpnl):+.2f}")
+
+        lines += [
+            f"",
+            f"<b>[ TOTAL DESDE {desde.strftime('%d/%m/%y') if desde else '?'} ]</b>",
+            f"• Trades: {tot_total}  ✅{tot_wins}  ❌{tot_losses}",
+            f"• Win Rate: <b>{tot_wr}%</b>",
+            f"• PnL acumulado: <b>${float(tot_pnl or 0):+.2f}</b>",
+            f"• Promedio/trade: {float(tot_avg or 0):+.1f}%",
+            f"• Mejor trade: {float(tot_best or 0):+.1f}%  |  Peor: {float(tot_worst or 0):+.1f}%",
+            f"",
+            f"<b>[ CAPITAL ]</b>",
+            f"• Capital: <b>${float(cap['capital']):.2f}</b>",
+            f"• PnL hoy (sistema): ${float(cap['daily_pnl']):+.2f}",
+        ]
+
+        send_message("\n".join(lines))
         log.info(f"📊 Daily summary enviado | Capital: ${cap['capital']:.2f} | "
-                 f"Win rate: {win_rate:.0f}% | P&L día: ${cap['daily_pnl']:+.2f}")
+                 f"WR día: {day_wr}% | P&L día: ${day_pnl:+.2f}")
+    except Exception as e:
+        log.error(f"send_daily_summary error: {e}")
     finally:
         pool.putconn(conn)
 
@@ -935,7 +985,6 @@ def rebalance_strategy_capital():
                      f"${old_cap:.0f}{arrow}${new_cap:.0f}")
 
     sync_paper_capital()
-    send_message("\n".join(lines))
     log.info("✅ Rebalanceo completado")
 
 
@@ -1026,6 +1075,8 @@ def _apply_partial_pnl(strategy, pnl, half_size):
 _no_price_count: dict[int, int] = {}
 # Trades con TP extendido por momentum fuerte (en memoria)
 _tp_extended: set = set()
+_emergency_cooldown: dict[str, float] = {}   # mint → timestamp último EMERGENCY_EXIT
+EMERGENCY_COOLDOWN_SECS = 900                # 15 min sin re-entrar tras un rug
 # Máx ciclos sin precio antes de cerrar al stop máximo (6 × 10s = 60s)
 NO_PRICE_LIMIT = 6
 
@@ -1140,6 +1191,7 @@ def manage_open_trades():
             )
             _apply_pnl_to_cap(strategy, pnl, trade_size, False)
             _tp_extended.discard(tid)
+            _emergency_cooldown[mint] = time.time()
 
         # ── STOP LOSS ADAPTATIVO ────────────────────────────
         elif current_price <= entry * float(stop_loss_pct):
@@ -1166,9 +1218,10 @@ _monitoring_alerted: dict = {}   # throttle por tipo de alerta
 def _check_monitoring():
     """
     Checks periódicos de salud del sistema. Llamado cada hora desde run().
-    - 5 trades consecutivos perdedores por estrategia → alerta
-    - Sin muestras ML limpias en 6h → alerta
-    - Drawdown 10-15% → alerta amarilla (>15% ya cubierto en get_drawdown_factor)
+    - 5 trades consecutivos perdedores → log
+    - Sin muestras ML en 6h → log
+    - Drawdown 10-15% → log
+    - Bot sin abrir trades en horario activo > 4h → alerta Telegram (único que necesitas saber)
     """
     now_ts = time.monotonic()
 
@@ -1185,10 +1238,6 @@ def _check_monitoring():
             """, (strat_name,))
             results = [r[0] for r in cur.fetchall()]
             if len(results) == 5 and not any(results):
-                key = f"loss_streak_{strat_name}"
-                if now_ts - _monitoring_alerted.get(key, 0) > 3600:
-                    _monitoring_alerted[key] = now_ts
-                    alert_consecutive_losses(5, strat_name)
                     log.warning(f"🔴 [{strat_name}] 5 trades consecutivos en pérdida")
 
         # ── Sin muestras ML limpias ────────────────────
@@ -1200,10 +1249,6 @@ def _check_monitoring():
         if row and row[0] is not None:
             hours_since = float(row[0])
             if hours_since > 6.0:
-                key = "no_ml_samples"
-                if now_ts - _monitoring_alerted.get(key, 0) > 3600:
-                    _monitoring_alerted[key] = now_ts
-                    alert_no_ml_samples(hours_since)
                     log.warning(f"⚠️  Sin muestras ML: {hours_since:.1f}h")
 
         # ── Drawdown amarillo (10-15%) ─────────────────
@@ -1216,14 +1261,26 @@ def _check_monitoring():
                 continue
             dd = (peak - scap['capital']) / peak
             if 0.10 <= dd < 0.15:
-                key = f"dd_yellow_{strat_name}"
-                if now_ts - _monitoring_alerted.get(key, 0) > 3600:
+                    log.warning(f"⚠️  [{strat_name}] Drawdown amarillo: {dd*100:.1f}%")
+
+        # ── Bot sin trades en horario activo (la alerta que SÍ necesitas) ───
+        cur.execute("""
+            SELECT EXTRACT(EPOCH FROM (NOW() - MAX(opened_at))) / 3600
+            FROM paper_trades WHERE status IN ('OPEN','CLOSED')
+        """)
+        row = cur.fetchone()
+        if row and row[0] is not None:
+            hours_idle = float(row[0])
+            if hours_idle > 4.0 and is_trading_hours():
+                key = "bot_idle"
+                if now_ts - _monitoring_alerted.get(key, 0) > 14400:  # max 1 alerta/4h
                     _monitoring_alerted[key] = now_ts
                     send_message(
-                        f"⚠️ DRAWDOWN AMARILLO [{strat_name}] | "
-                        f"{dd*100:.1f}% desde pico ${peak:.2f} → ${scap['capital']:.2f}"
+                        f"⚠️ <b>BOT SIN OPERAR</b>\n"
+                        f"Lleva <b>{hours_idle:.1f}h</b> sin abrir trades en horario activo.\n"
+                        f"Verifica el sistema."
                     )
-                    log.warning(f"⚠️  [{strat_name}] Drawdown amarillo: {dd*100:.1f}%")
+                    log.warning(f"⚠️ Bot idle {hours_idle:.1f}h en horario activo")
 
         cur.close()
     except Exception as e:
@@ -1237,7 +1294,6 @@ def run():
     sync_paper_capital()   # Sincronizar al arrancar por si hay deriva acumulada
     log.info("💰 Paper Trading Engine arrancando...")
     log.info(f"⏱  Ciclo posiciones: {POSITION_CHECK_INTERVAL}s | Ciclo señales: {SIGNAL_CHECK_INTERVAL}s")
-    alert_system_status("OK", "Paper Trading Engine iniciado")
 
     last_daily_reset  = datetime.now().date()
     last_signal_check = 0.0
@@ -1286,8 +1342,13 @@ def run():
                         log.warning(f"🌍 MACRO RISK-OFF ({macro_reason}) — ciclo saltado")
                         continue
 
+                    saturday = is_saturday_mode()
+                    effective_ml_min = SATURDAY_ML_MIN if saturday else 80
+                    if saturday:
+                        log.info(f"🗓️ Modo sábado: ML>={effective_ml_min}%, sizing×{SATURDAY_SIZE_FACTOR}")
+
                     # ── Estrategias standard (requieren entry_signal='ENTER') ──
-                    signals = check_new_signals(ml_min=80)
+                    signals = check_new_signals(ml_min=effective_ml_min)
                     for sig in signals:
                         mint, name, symbol, price, ml_prob, score, narrative, liquidity = sig
                         if not price:
@@ -1340,9 +1401,15 @@ def run():
                             else:
                                 t_size = round(scap['capital'] * scfg['size_pct'] * dd_factor, 2)
                                 base_label = f"Fixed {scfg['size_pct']*100:.0f}%"
+                            if saturday:
+                                t_size = round(t_size * SATURDAY_SIZE_FACTOR, 2)
                             t_size, vol_factor = get_vol_adjusted_size(t_size, strat_name)
                             vol_tag = f" × VOL{vol_factor}" if vol_factor < 1.0 else ""
-                            log.info(f"💰 [{strat_name}] {base_label} × DD{dd_factor}{vol_tag} = ${t_size:.2f} | ML={ml_prob}%")
+                            sat_tag = " × SAT0.5" if saturday else ""
+                            log.info(f"💰 [{strat_name}] {base_label} × DD{dd_factor}{vol_tag}{sat_tag} = ${t_size:.2f} | ML={ml_prob}%")
+                            if time.time() - _emergency_cooldown.get(mint, 0) < EMERGENCY_COOLDOWN_SECS:
+                                log.info(f"⏭️ [{strat_name}] {name or mint[:8]} en cooldown post-EMERGENCY_EXIT — saltando")
+                                continue
                             open_trade(mint, name, symbol, price,
                                        ml_prob, score, narrative, t_size,
                                        strategy=strat_name, liquidity_usd=liquidity)

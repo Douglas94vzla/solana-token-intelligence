@@ -75,24 +75,24 @@ def health():
 # ─────────────────────────────────────────
 @app.get("/tokens")
 def get_tokens(
-    limit: int = Query(default=50, le=200),
-    offset: int = Query(default=0),
-    hours: int = Query(default=24),
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+    hours: int = Query(default=24, ge=1, le=168),
     with_name: bool = Query(default=True)
 ):
     conn = get_conn()
     try:
         cur = conn.cursor()
         since = datetime.utcnow() - timedelta(hours=hours)
-        name_filter = "AND name IS NOT NULL AND name != ''" if with_name else ""
-        cur.execute(f"""
+        cur.execute("""
             SELECT mint, name, symbol, status, score, created_at,
                    twitter, telegram, website
             FROM discovered_tokens
-            WHERE created_at > %s {name_filter}
+            WHERE created_at > %s
+              AND (NOT %s OR (name IS NOT NULL AND name != ''))
             ORDER BY created_at DESC
             LIMIT %s OFFSET %s
-        """, (since, limit, offset))
+        """, (since, with_name, limit, offset))
         rows = cur.fetchall()
         cur.close()
         return {

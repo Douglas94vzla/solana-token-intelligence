@@ -21,3 +21,7 @@ sonda_definitiva.py
 test_connection.py
 test_filter.py
 the_real_pump_check.py
+
+*.pkl
+reports/
+monitor_state.json

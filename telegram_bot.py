@@ -98,18 +98,28 @@ def alert_paper_trade(action, token_name, mint, price, pnl=None,
         )
     return send_message(msg)
 
-def alert_daily_summary(capital, pnl, pnl_pct, wins, losses, best_trade):
-    """Resumen diario"""
-    emoji = "📈" if pnl > 0 else "📉"
+def alert_daily_summary(capital, pnl_today, wins_today, losses_today,
+                        wins_total, losses_total):
+    """Resumen diario a las 6 PM."""
+    total_today = wins_today + losses_today
+    wr_today    = wins_today / total_today * 100 if total_today > 0 else 0
+    total_sys   = wins_total + losses_total
+    wr_sys      = wins_total / total_sys * 100 if total_sys > 0 else 0
+    emoji       = "📈" if pnl_today >= 0 else "📉"
+    fecha       = datetime.now().strftime('%d-%m-%Y')
+
     msg = (
-        f"{emoji} <b>RESUMEN DEL DÍA</b>\n"
+        f"{emoji} <b>RESUMEN DIARIO — {fecha}</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"💰 Capital:  <b>${capital:.2f}</b>\n"
-        f"📊 P&L:      <b>${pnl:+.2f}</b> ({pnl_pct:+.1f}%)\n"
-        f"✅ Wins:     <b>{wins}</b>\n"
-        f"❌ Losses:   <b>{losses}</b>\n"
-        f"🏆 Mejor:    <b>{best_trade}</b>\n"
-        f"📅 {datetime.now().strftime('%Y-%m-%d')}"
+        f"💰 Capital:         <b>${capital:,.2f}</b>\n"
+        f"📊 P&L del día:     <b>${pnl_today:+.2f}</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"✅ Wins hoy:        <b>{wins_today}</b>\n"
+        f"❌ Losses hoy:      <b>{losses_today}</b>\n"
+        f"🎯 WR del día:      <b>{wr_today:.0f}%</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"📈 WR del sistema:  <b>{wr_sys:.0f}%</b>  "
+        f"({wins_total}W / {losses_total}L)"
     )
     return send_message(msg)
 

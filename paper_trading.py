@@ -43,6 +43,7 @@ DAILY_LOSS_LIMIT      = 0.03     # Parar si perdemos 3% en el día
 SLIPPAGE              = 0.03     # Slippage base (fallback si no hay liquidez)
 FEES                  = 0.005    # 0.5% fees
 TRADE_HOURS_UTC       = (13, 23) # Solo abrir trades entre 13h y 23h UTC
+REPORT_HOUR_LOCAL     = 18       # Hora local del servidor para el resumen diario (18 = 6 PM)
 POSITION_CHECK_INTERVAL = 10     # Revisar posiciones abiertas cada 10s
 SIGNAL_CHECK_INTERVAL   = 60     # Buscar señales nuevas cada 60s
 STOP_LOSS_MIN         = 0.85     # Stop adaptativo mínimo: -15%
@@ -549,61 +550,47 @@ def is_trading_hours():
     return TRADE_HOURS_UTC[0] <= hour <= TRADE_HOURS_UTC[1]
 
 def send_daily_summary():
-    """Envía resumen diario por Telegram con métricas del día."""
+    """Envía resumen diario por Telegram a las REPORT_HOUR_LOCAL."""
     cap  = get_capital()
     conn = pool.getconn()
     try:
         cur = conn.cursor()
+
+        # Trades cerrados HOY (estrategia STANDARD)
         cur.execute("""
             SELECT
-                COUNT(*) FILTER (WHERE pnl > 0)                 as wins,
-                COUNT(*) FILTER (WHERE pnl <= 0)                as losses,
-                COALESCE(MAX(pnl_pct), 0)                       as best_pct,
-                COALESCE(MIN(pnl_pct), 0)                       as worst_pct,
-                COALESCE(SUM(pnl) FILTER (WHERE closed_at::date = CURRENT_DATE - 1), 0) as day_pnl
+                COUNT(*) FILTER (WHERE pnl_pct > 0)   AS wins_today,
+                COUNT(*) FILTER (WHERE pnl_pct <= 0)  AS losses_today,
+                COALESCE(SUM(pnl), 0)                 AS pnl_today
             FROM paper_trades
             WHERE status = 'CLOSED'
+              AND closed_at >= CURRENT_DATE
+              AND COALESCE(strategy, 'STANDARD') = 'STANDARD'
         """)
-        row = cur.fetchone()
-        wins, losses, best_pct, worst_pct, day_pnl = row
-        total = (wins or 0) + (losses or 0)
-        win_rate = (wins / total * 100) if total > 0 else 0
-        pnl_pct  = (float(cap['daily_pnl']) / INITIAL_CAPITAL) * 100
+        wins_today, losses_today, pnl_today = cur.fetchone()
 
-        # ── MISSED TRADES DEL DÍA ───────────────────────
+        # Totales históricos del sistema
         cur.execute("""
-            SELECT
-                COUNT(*)                                                   as total_missed,
-                COUNT(*) FILTER (WHERE tracked_1h)                         as tracked,
-                COALESCE(AVG(pnl_pct_1h) FILTER (WHERE tracked_1h), 0)    as avg_pnl_1h,
-                COALESCE(SUM(phantom_pnl_1h) FILTER (WHERE tracked_1h), 0) as phantom_total,
-                COUNT(*) FILTER (WHERE pnl_pct_1h > 0 AND tracked_1h)     as would_wins,
-                MAX(pnl_pct_1h) FILTER (WHERE tracked_1h)                  as best_missed_pct,
-                (ARRAY_AGG(name ORDER BY pnl_pct_1h DESC NULLS LAST))[1]  as best_missed_name,
-                rejection_reason
-            FROM missed_trades
-            WHERE DATE(missed_at) = CURRENT_DATE - 1
-            GROUP BY rejection_reason
-            ORDER BY SUM(phantom_pnl_1h) DESC NULLS LAST
+            SELECT wins, losses FROM paper_capital LIMIT 1
         """)
-        missed_rows = cur.fetchall()
+        wins_total, losses_total = cur.fetchone()
+
         cur.close()
 
         alert_daily_summary(
-            capital   = cap['capital'],
-            pnl       = cap['daily_pnl'],
-            pnl_pct   = pnl_pct,
-            wins      = wins or 0,
-            losses    = losses or 0,
-            best_trade= f"{float(best_pct):+.1f}%"
+            capital      = float(cap['capital']),
+            pnl_today    = float(pnl_today),
+            wins_today   = int(wins_today or 0),
+            losses_today = int(losses_today or 0),
+            wins_total   = int(wins_total or 0),
+            losses_total = int(losses_total or 0),
         )
 
-        if missed_rows:
-            from telegram_bot import alert_missed_summary
-            alert_missed_summary(missed_rows)
-
-        log.info(f"📊 Daily summary enviado | Capital: ${cap['capital']:.2f} | "
-                 f"Win rate: {win_rate:.0f}% | P&L día: ${cap['daily_pnl']:+.2f}")
+        total_today = (wins_today or 0) + (losses_today or 0)
+        wr_today    = wins_today / total_today * 100 if total_today > 0 else 0
+        log.info(f"📊 Resumen enviado | Capital: ${cap['capital']:.2f} | "
+                 f"Hoy: {wins_today}W/{losses_today}L WR:{wr_today:.0f}% | "
+                 f"PnL día: ${pnl_today:+.2f}")
     finally:
         pool.putconn(conn)
 
@@ -851,18 +838,25 @@ def run():
     alert_system_status("OK", "Paper Trading Engine iniciado")
 
     last_daily_reset  = datetime.now().date()
-    last_signal_check = 0.0   # timestamp de la última búsqueda de señales
+    last_signal_check = 0.0
     last_summary      = 0.0
+    last_report_date  = None   # fecha en que se envió el último resumen de 6 PM
 
     while True:
         try:
-            now = time.monotonic()
+            now      = time.monotonic()
+            now_dt   = datetime.now()
 
-            # ── RESET DIARIO ───────────────────────────────
-            if datetime.now().date() > last_daily_reset:
-                send_daily_summary()
+            # ── RESET DIARIO (medianoche) ──────────────────
+            if now_dt.date() > last_daily_reset:
                 reset_daily_pnl()
-                last_daily_reset = datetime.now().date()
+                last_daily_reset = now_dt.date()
+
+            # ── RESUMEN DIARIO A LAS 6 PM ──────────────────
+            if (now_dt.hour == REPORT_HOUR_LOCAL
+                    and last_report_date != now_dt.date()):
+                send_daily_summary()
+                last_report_date = now_dt.date()
 
             # ── GESTIONAR POSICIONES ABIERTAS (cada 10s) ───
             # SIEMPRE gestionar posiciones abiertas, incluso con límite diario activo

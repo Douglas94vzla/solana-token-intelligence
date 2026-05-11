@@ -34,6 +34,9 @@ FEATURES_PATH = '/root/solana_bot/features.pkl'
 ML_THRESHOLD      = 0.35    # Probabilidad mínima para ENTER (calibrada: base rate ~23%)
 RUG_THRESHOLD     = 60     # Rug score máximo permitido
 MIN_LIQUIDITY_USD = 3_000  # Liquidez mínima en USD para abrir trade
+# Narrativas bloqueadas: WR histórico <20% con >10 trades (análisis 845 trades May 2026)
+# POLITICS: 3.1% WR (64 trades), AI/AGI: 16.7% WR (12 trades)
+BLOCKED_NARRATIVES = {'POLITICS', 'AI/AGI'}
 
 # ── CARGAR MODELO ML ──────────────────────────────────
 def load_ml_model():
@@ -507,7 +510,7 @@ def get_watchlist():
     try:
         cur = conn.cursor()
         cur.execute("""
-            SELECT mint, name, symbol, survival_score, price_usd, market_cap
+            SELECT mint, name, symbol, survival_score, price_usd, market_cap, narrative
             FROM discovered_tokens
             WHERE signal IN ('STRONG_BUY', 'BUY')
             AND created_at > NOW() - INTERVAL '3 hours'
@@ -535,7 +538,7 @@ async def monitor_cycle():
 
         async def process_token(token):
             nonlocal enters
-            mint, name, symbol, score, orig_price, orig_mcap = token
+            mint, name, symbol, score, orig_price, orig_mcap, narrative = token
             async with semaphore:
                 data = await fetch_current_data(session, mint)
                 if not data or not data["price_usd"]:
@@ -544,6 +547,14 @@ async def monitor_cycle():
                 save_snapshot(mint, data)
                 history      = get_price_history(mint)
                 signal, momentum = compute_entry_signal(data, history)
+
+                # ── FILTRO NARRATIVA ─────────────────────────
+                if signal == 'ENTER' and narrative in BLOCKED_NARRATIVES:
+                    log.info(f"🚫 NARRATIVA BLOQUEADA | {name or mint[:8]} | {narrative}")
+                    log_missed_trade(mint, name, symbol, None, 'ENTRY_SIGNAL',
+                                     'NARRATIVE_FILTER', f'narrative={narrative}',
+                                     data["price_usd"])
+                    signal = 'WAIT'
 
                 # ── FILTRO RUG ────────────────────────────────
                 if signal == 'ENTER' and not is_rug_safe(mint):

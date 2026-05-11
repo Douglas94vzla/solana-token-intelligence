@@ -30,8 +30,8 @@ pool = psycopg2.pool.ThreadedConnectionPool(
 )
 
 # ── RISK MANAGEMENT ───────────────────────────────────
-INITIAL_CAPITAL       = 1000.0   # Capital simulado
-TRADE_SIZE_PCT        = 0.02     # 2% por trade
+INITIAL_CAPITAL       = 150.0    # Capital simulado — reset 2026-05-11 ($150 real target)
+TRADE_SIZE_PCT        = 0.05     # 5% por trade (ajustado para capital pequeño de $150)
 MAX_OPEN_TRADES       = 3        # Máximo trades simultáneos
 TAKE_PROFIT           = 1.80     # +80% TP final (50% restante) — subido de 1.50 el 2026-04-10
 PARTIAL_TP_PCT        = 1.30     # +30% → cierra 50% de la posición — subido de 1.20 el 2026-04-10
@@ -42,7 +42,9 @@ MAX_HOLD_MINUTES      = 30       # Timeout 30 minutos (tokens que no despegan en
 DAILY_LOSS_LIMIT      = 0.03     # Parar si perdemos 3% en el día
 SLIPPAGE              = 0.03     # Slippage base (fallback si no hay liquidez)
 FEES                  = 0.005    # 0.5% fees
-TRADE_HOURS_UTC       = (13, 23) # Solo abrir trades entre 13h y 23h UTC
+# Horas permitidas (UTC) — análisis 845 trades: horas con WR >= 45%
+# Bloqueadas: 15h(39%), 19h(40%), 20h(39%), 21h(38%), 23h(37%)
+TRADE_HOURS_UTC       = frozenset({14, 16, 17, 18, 22})
 REPORT_HOUR_LOCAL     = 18       # Hora local del servidor para el resumen diario (18 = 6 PM)
 POSITION_CHECK_INTERVAL = 10     # Revisar posiciones abiertas cada 10s
 SIGNAL_CHECK_INTERVAL   = 60     # Buscar señales nuevas cada 60s
@@ -60,17 +62,17 @@ EMERGENCY_EXIT_MINUTES    = 5    # Solo aplica si el trade tiene menos de 5 min 
 #                'early'    → usa check_early_entry_signals() (sin filtros de social/liquidez)
 STRATEGIES = {
     'CONSERVATIVE': {
-        'ml_min':          80,   # subido de 50 el 2026-04-10 — análisis 106 trades
+        'ml_min':          80,
         'max_open':         2,
-        'size_pct':        0.01,
-        'initial_capital': 333.0,
+        'size_pct':        0.03,   # 3% de $150 = ~$4.5 por trade
+        'initial_capital': 150.0,
         'signal_source':   'standard',
     },
     'STANDARD': {
-        'ml_min':          80,   # subido de 35 el 2026-04-10 — ML 65-79% WR 50% PnL negativo
+        'ml_min':          80,
         'max_open':         3,
-        'size_pct':        None,    # Usa Kelly sizing
-        'initial_capital': 333.0,
+        'size_pct':        0.05,   # 5% de $150 = ~$7.5 por trade (Kelly desactivado para capital pequeño)
+        'initial_capital': 150.0,
         'signal_source':   'standard',
     },
 }
@@ -102,7 +104,7 @@ def setup_db():
 
             CREATE TABLE IF NOT EXISTS paper_capital (
                 id SERIAL PRIMARY KEY,
-                capital NUMERIC(20,2) DEFAULT 1000.0,
+                capital NUMERIC(20,2) DEFAULT 150.0,
                 daily_pnl NUMERIC(20,2) DEFAULT 0,
                 total_pnl NUMERIC(20,2) DEFAULT 0,
                 wins INTEGER DEFAULT 0,
@@ -111,7 +113,7 @@ def setup_db():
             );
 
             INSERT INTO paper_capital (capital)
-            SELECT 1000.0 WHERE NOT EXISTS (SELECT 1 FROM paper_capital);
+            SELECT 150.0 WHERE NOT EXISTS (SELECT 1 FROM paper_capital);
         """)
         conn.commit()
         # Tabla de capital por estrategia (mejora 14)
@@ -545,9 +547,9 @@ def is_daily_limit_hit():
     return cap['daily_pnl'] / INITIAL_CAPITAL < -DAILY_LOSS_LIMIT
 
 def is_trading_hours():
-    """Solo abrir trades en horario de mayor actividad (13h–23h UTC)"""
+    """Solo abrir trades en horas con WR >= 45% según análisis histórico."""
     hour = datetime.now(timezone.utc).hour
-    return TRADE_HOURS_UTC[0] <= hour <= TRADE_HOURS_UTC[1]
+    return hour in TRADE_HOURS_UTC
 
 def send_daily_summary():
     """Envía resumen diario por Telegram a las REPORT_HOUR_LOCAL."""

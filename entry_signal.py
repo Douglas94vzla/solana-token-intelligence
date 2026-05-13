@@ -429,11 +429,11 @@ def check_quality_filters(mint):
         if rug_flags and 'ONLY_0_HOLDERS' in rug_flags:
             return True, 'ONLY_0_HOLDERS (sin holders on-chain)'
 
-        # 2) Liquidez mínima — solo aplica a tokens con par DexScreener
-        # Tokens en bonding curve (sin pair_address) no tienen liquidity_usd
-        if pair_address is not None:
-            liq = float(liquidity_usd) if liquidity_usd is not None else 0.0
-            if liq < MIN_LIQUIDITY_USD:
+        # 2) Liquidez mínima — solo bloquear si DexScreener reportó un valor real > 0
+        # $0 significa "sin dato en DB", no "sin liquidez" — no bloquear por ausencia de dato
+        if pair_address is not None and liquidity_usd is not None:
+            liq = float(liquidity_usd)
+            if liq > 0 and liq < MIN_LIQUIDITY_USD:
                 return True, f'liquidez insuficiente (${liq:,.0f} < ${MIN_LIQUIDITY_USD:,})'
 
         return False, ''

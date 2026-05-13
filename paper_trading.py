@@ -42,9 +42,9 @@ MAX_HOLD_MINUTES      = 30       # Timeout 30 minutos (tokens que no despegan en
 DAILY_LOSS_LIMIT      = 0.03     # Parar si perdemos 3% en el día
 SLIPPAGE              = 0.03     # Slippage base (fallback si no hay liquidez)
 FEES                  = 0.005    # 0.5% fees
-# Horas permitidas (UTC) — análisis 845 trades: horas con WR >= 45%
-# Bloqueadas: 15h(39%), 19h(40%), 20h(39%), 21h(38%), 23h(37%)
-TRADE_HOURS_UTC       = frozenset({14, 16, 17, 18, 22})
+# Horas permitidas (UTC) — rango ampliado 13-22h para no perder volumen con capital $150
+# (análisis previo con 845 trades era en capital $1000 — insuficiente data en $150 para filtrar)
+TRADE_HOURS_UTC       = frozenset({13, 14, 15, 16, 17, 18, 19, 20, 21, 22})
 REPORT_HOUR_LOCAL     = 18       # Hora local del servidor para el resumen diario (18 = 6 PM)
 POSITION_CHECK_INTERVAL = 10     # Revisar posiciones abiertas cada 10s
 SIGNAL_CHECK_INTERVAL   = 60     # Buscar señales nuevas cada 60s
@@ -607,16 +607,16 @@ def reset_daily_pnl():
         pool.putconn(conn)
 
 def sync_paper_capital():
-    """Mantiene paper_capital sincronizado como agregado de todas las estrategias."""
+    """Mantiene paper_capital sincronizado con la estrategia STANDARD (cuenta principal)."""
     conn = pool.getconn()
     try:
         cur = conn.cursor()
         cur.execute("""
             UPDATE paper_capital SET
-                capital    = (SELECT COALESCE(SUM(capital),   0) FROM strategy_capital),
-                total_pnl  = (SELECT COALESCE(SUM(total_pnl), 0) FROM strategy_capital),
-                wins       = (SELECT COALESCE(SUM(wins),      0) FROM strategy_capital),
-                losses     = (SELECT COALESCE(SUM(losses),    0) FROM strategy_capital),
+                capital    = (SELECT COALESCE(capital,   0) FROM strategy_capital WHERE strategy = 'STANDARD'),
+                total_pnl  = (SELECT COALESCE(total_pnl, 0) FROM strategy_capital WHERE strategy = 'STANDARD'),
+                wins       = (SELECT COALESCE(wins,      0) FROM strategy_capital WHERE strategy = 'STANDARD'),
+                losses     = (SELECT COALESCE(losses,    0) FROM strategy_capital WHERE strategy = 'STANDARD'),
                 updated_at = NOW()
         """)
         conn.commit()
